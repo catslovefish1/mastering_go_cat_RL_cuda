@@ -63,6 +63,8 @@ def simulate_batch_games(
             moves = bot.select_moves(boards)
             boards.step(moves)
             ply += 1
+
+
             
             # Log progress
             if log_interval and ply % log_interval == 0:
@@ -71,17 +73,9 @@ def simulate_batch_games(
                 print(f"Ply {ply:4d}: {finished_count}/{num_games} finished")
      
     elapsed = time.time() - t0
+    print("time elasped:", elapsed)
     
-    # Results
-    scores = boards.compute_scores()
-    black_wins = (scores[:, 0] > scores[:, 1]).sum().cpu()
-    white_wins = (scores[:, 1] > scores[:, 0]).sum().cpu()
-    draws = num_games - black_wins - white_wins
-    
-    print(f"\nFinished in {elapsed:.2f}s ({ply} moves)")
-    print(f"Black wins: {black_wins} ({black_wins/num_games:.1%})")
-    print(f"White wins: {white_wins} ({white_wins/num_games:.1%})")
-    print(f"Draws: {draws} ({draws/num_games:.1%})")
+
     
     # Save game histories
     if save_history:
@@ -90,15 +84,30 @@ def simulate_batch_games(
     # Timing
     if enable_timing:
         print_timing_report(boards)
-        print_performance_metrics(elapsed, ply, num_games)
+        print_timing_report(boards.legal_checker._checker)
+        print_performance_metrics(elapsed, ply, num_games)    
+
+
+    MB = 1024 ** 2
+    peak_alloc = torch.cuda.max_memory_allocated(device) / MB
+    peak_res   = torch.cuda.max_memory_reserved(device) / MB
+        
+    cur  = torch.cuda.memory_allocated(device) / MB
+    res  = torch.cuda.memory_reserved(device) / MB
+        
+    print(f"[CUDA][FINAL] current={cur:.1f} MB reserved={res:.1f} MB")
+    print(f"[CUDA][FINAL] peak_alloc={peak_alloc:.1f} MB peak_reserved={peak_res:.1f} MB")
+
+    
 
 if __name__ == "__main__":
     simulate_batch_games(
-        num_games=2**14,
+        num_games=2**12,
         board_size=19,
-        history_factor=1,
-        log_interval=1,
+        history_factor=3,
+        log_interval=2**4,
         show_boards=2,
+        
         enable_timing=True,
         save_history=True,
         enable_super_ko=True,
