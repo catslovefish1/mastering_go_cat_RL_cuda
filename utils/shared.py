@@ -44,94 +44,11 @@ def select_device() -> torch.device:
     return torch.device("cpu")
 
 
-# ========================= COORDINATE UTILITIES =========================
 
 
-def flat_to_2d(flat_indices: Tensor, width: int) -> Tuple[Tensor, Tensor]:
-    """Convert flat indices to 2D coordinates.
-
-    Args:
-        flat_indices: Shape (N,) flat position indices.
-        width: Board width for modulo operation.
-
-    Returns:
-        Tuple of (rows, cols) tensors.
-    """
-    rows = flat_indices // width
-    cols = flat_indices % width
-    return rows, cols
 
 
-def coords_to_flat(rows: Tensor, cols: Tensor, width: int) -> Tensor:
-    """Convert 2D coordinates to flat indices.
 
-    Args:
-        rows: Row coordinates.
-        cols: Column coordinates.
-        width: Board width.
-
-    Returns:
-        Flat indices tensor.
-    """
-    return rows * width + cols
-
-
-# ========================= POSITION UTILITIES =========================
-
-
-def create_pass_positions(batch_size: int, device: torch.device) -> Tensor:
-    """Create tensor of pass moves for given batch size.
-
-    Pass moves are represented as [-1, -1] in the position tensor.
-
-    Args:
-        batch_size: Number of positions to create.
-        device: Target device for tensor creation.
-
-    Returns:
-        Tensor of shape (batch_size, 2) filled with -1.
-    """
-    return torch.full((batch_size, 2), -1, dtype=torch.int16, device=device)
-
-
-# ========================= PROBABILITY UTILITIES =========================
-
-
-def compute_uniform_probabilities(mask: Tensor) -> Tensor:
-    """Compute uniform probability distribution over True values in mask.
-
-    Args:
-        mask: Shape (N, M) boolean mask.
-
-    Returns:
-        Shape (N, M) probability distribution (sums to 1 along dim=1).
-    """
-    probs = mask.float()
-    row_sums = probs.sum(dim=1, keepdim=True)
-    # Avoid division by zero: rows with no True entries stay all zeros
-    safe_sums = row_sums.clamp(min=1.0)
-    return probs / safe_sums
-
-
-def sample_from_mask(mask: Tensor, num_samples: int = 1) -> Tensor:
-    """Sample indices from a boolean mask with uniform probability.
-
-    Args:
-        mask: Shape (N, M) boolean mask.
-        num_samples: Number of samples per row.
-
-    Returns:
-        Shape (N, num_samples) or (N,) if num_samples=1.
-    """
-    probabilities = compute_uniform_probabilities(mask)
-    sampled = torch.multinomial(probabilities, num_samples=num_samples)
-    if num_samples == 1:
-        sampled = sampled.squeeze(1)
-    return sampled
-
-
-# ========================= BATCH UTILITIES =========================
-# (placeholder for future shared batch helpers)
 
 
 # ========================= TIMING UTILITIES =========================

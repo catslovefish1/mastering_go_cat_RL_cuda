@@ -14,14 +14,13 @@ from torch import Tensor
 from utils.shared import (
     select_device,
     timed_method,
-    print_timing_report,
+    print_timing_report,  # still imported for external use
 )
 
 # -----------------------------------------------------------------------------
 # GoLegalMoveChecker import
 # -----------------------------------------------------------------------------
 from engine import GoLegalMoveChecker as legal_module
-
 GoLegalMoveChecker = legal_module.GoLegalMoveChecker
 
 # -----------------------------------------------------------------------------
@@ -34,9 +33,9 @@ class Stone:
     EMPTY: int = -1
 
 
-BoardTensor = Tensor     # (B, H, W)
+BoardTensor   = Tensor  # (B, H, W)
 PositionTensor = Tensor  # (B, 2)
-PassTensor = Tensor      # (B,)
+PassTensor     = Tensor  # (B,)
 
 
 # ========================= GO ENGINE =========================================
@@ -44,9 +43,6 @@ PassTensor = Tensor      # (B,)
 class TensorBoard(torch.nn.Module):
     """GPU-optimized multi-game Go board with batched legal-move checking."""
 
-    # ------------------------------------------------------------------ #
-    # Construction                                                       #
-    # ------------------------------------------------------------------ #
     def __init__(
         self,
         batch_size: int = 1,
@@ -59,33 +55,34 @@ class TensorBoard(torch.nn.Module):
     ) -> None:
         super().__init__()
 
-        self.batch_size = batch_size
-        self.board_size = board_size
+        # --- config --------------------------------------------------------
+        self.batch_size     = batch_size
+        self.board_size     = board_size
         self.history_factor = history_factor
-        self.device = device or select_device()
-        self.enable_timing = enable_timing
+        self.device         = device or select_device()
+        self.enable_timing  = enable_timing
         self.enable_super_ko = enable_super_ko
-        self.debug_place_trace = debug_place_trace  # kept for API symmetry, not used yet
+        self.debug_place_trace = debug_place_trace  # reserved for future debugging
 
-        # Timing infra (exclusive / inclusive handled by timed_method)
+        # --- timing infra (used by @timed_method) --------------------------
         if enable_timing:
-            self.timings = defaultdict(list)
+            self.timings     = defaultdict(list)
             self.call_counts = defaultdict(int)
         else:
-            self.timings = {}
+            self.timings     = {}
             self.call_counts = {}
 
-        # Core legal move checker (C++/PyTorch backend)
+        # --- core legal move checker (C++/PyTorch backend) -----------------
         self.legal_checker = GoLegalMoveChecker(
             board_size=board_size,
             device=self.device,
         )
 
-        # Initialize Zobrist tables + mutable state
+        # --- zobrist + mutable state --------------------------------------
         self._init_zobrist_tables()
         self._init_state()
 
-        # Cache for legal moves and capture info
+        # last legal-move info (used by _place_stones)
         self._last_legal_mask: Optional[Tensor] = None
         self._last_info: Optional[Dict] = None
 
@@ -104,32 +101,32 @@ class TensorBoard(torch.nn.Module):
         dev = self.device
 
         # Capture staging + workspace, allocated once and reused
-        self._cap_vals = torch.zeros(
-            (B, self.N2, 4), dtype=torch.int32, device=dev
-        )
+        self._cap_vals = torch.zeros((B, self.N2, 4), dtype=torch.int32, device=dev)
         self._cap_vals.fill_(0)  # touch pages
 
         # Reuse across calls: 4 × (B, N2) int32 workspaces
-        self._ws_int32 = torch.zeros(
-            (4, B, self.N2), dtype=torch.int32, device=dev
-        )
+        self._ws_int32 = torch.zeros((4, B, self.N2), dtype=torch.int32, device=dev)
         self._ws_int32.fill_(0)
 
         # Group XOR workspace for super-ko (capacity = B * N2)
         self._group_xor = torch.zeros(B * self.N2, dtype=torch.int32, device=dev)
 
         # Random Zobrist values for each position and state: empty(0), black(1), white(2)
-        torch.manual_seed(42)  # reproducible profiling / debugging
+        # Use local generator so we don't touch global RNG state.
+        g = torch.Generator(device=dev)
+        g.manual_seed(42)
+
         self.zobrist_table = torch.randint(
             0,
             2**31,
-            (H, W, 3),
+            (H, W, 3),   # [row, col, {empty, black, white}]
             dtype=torch.int32,
             device=dev,
+            generator=g,
         )
 
         # Flattened Zobrist: (N2, 3) and its transpose (3, N2)
-        self.Zpos = self.zobrist_table.view(self.N2, 3).contiguous()
+        self.Zpos  = self.zobrist_table.view(self.N2, 3).contiguous()
         self.ZposT = self.Zpos.transpose(0, 1).contiguous()  # (3, N2)
 
     # ------------------------------------------------------------------ #
@@ -141,22 +138,26 @@ class TensorBoard(torch.nn.Module):
         H = W = self.board_size
         dev = self.device
 
-        # Main board state
+        # --- main board state -------------------------------------------
         self.register_buffer(
             "board",
             torch.full((B, H, W), Stone.EMPTY, dtype=torch.int8, device=dev),
         )
+        # current player (0=black, 1=white)
+        self.register_buffer(
+            "current_player",
+            torch.zeros(B, dtype=torch.int8, device=dev),
+        )
+        # pass counter (game ends at 2)
+        self.register_buffer(
+            "pass_count",
+            torch.zeros(B, dtype=torch.int8, device=dev),
+        )
 
-        # Current player (0=black, 1=white)
-        self.register_buffer("current_player", torch.zeros(B, dtype=torch.int8, device=dev))
-
-        # Pass counter (game ends at 2)
-        self.register_buffer("pass_count", torch.zeros(B, dtype=torch.int8, device=dev))
-
-        # -------------------- History tracking --------------------
+        # --- history tracking -------------------------------------------
         max_moves = H * W * self.history_factor
 
-        # Keep board_history only for first up to 16 boards (debug/printing)
+        # keep board_history only for first up to 16 boards (debug/printing)
         self._board_hist_track_B = 16
         self.register_buffer(
             "board_history",
@@ -168,13 +169,17 @@ class TensorBoard(torch.nn.Module):
             ),
         )
 
-        self.register_buffer("move_count", torch.zeros(B, dtype=torch.int16, device=dev))
+        self.register_buffer(
+            "move_count",
+            torch.zeros(B, dtype=torch.int16, device=dev),
+        )
 
-        # Super-ko tracking with Zobrist hashing
+        # --- super-ko tracking via Zobrist -----------------------------
         if self.enable_super_ko:
-            # Current hash for each game
-            self.register_buffer("current_hash", torch.zeros(B, dtype=torch.int32, device=dev))
-            # History of hashes for super-ko detection
+            self.register_buffer(
+                "current_hash",
+                torch.zeros(B, dtype=torch.int32, device=dev),
+            )
             self.register_buffer(
                 "hash_history",
                 torch.zeros((B, max_moves), dtype=torch.int32, device=dev),
@@ -183,28 +188,22 @@ class TensorBoard(torch.nn.Module):
     # ==================== CORE UTILITIES ==================================== #
 
     def switch_player(self) -> None:
-        """Switch current player and invalidate cached legal moves."""
+        """Switch current player."""
         self.current_player = self.current_player ^ 1
-        self._invalidate_cache()
-
-    def _invalidate_cache(self) -> None:
-        """Clear cached legal moves and capture info."""
-        self._last_legal_mask = None
-        self._last_info = None
 
     # ==================== LEGAL MOVES ======================================= #
 
     @timed_method
     def legal_moves(self) -> BoardTensor:
-        """Compute / return cached legal-move mask (with optional super-ko)."""
-        if self._last_legal_mask is None:
-            legal_mask, legal_info = self._compute_legal_core()
+        """Compute legal moves (optionally filtered by super-ko)."""
+        legal_mask, legal_info = self._compute_legal_core()
 
-            if self.enable_super_ko:
-                legal_mask = self._filter_super_ko_vectorized(legal_mask, legal_info)
+        if self.enable_super_ko:
+            legal_mask = self._filter_super_ko_vectorized(legal_mask, legal_info)
 
-            self._last_legal_mask = legal_mask
-            self._last_info = legal_info
+        # cache info for _place_stones of the same ply
+        self._last_legal_mask = legal_mask
+        self._last_info = legal_info
 
         return self._last_legal_mask
 
@@ -264,10 +263,10 @@ class TensorBoard(torch.nn.Module):
         # ------------------------------------------------------------------ #
         # 2) CSR pieces                                                      #
         # ------------------------------------------------------------------ #
-        stone_global_index            = info["stone_global_index"]               # (K,)   int32
-        stone_global_pointer          = info["stone_global_pointer"]             # (R+1,) int32
-        group_global_pointer_per_board = info["group_global_pointer_per_board"]  # (B+1,) int32
-        captured_group_local_index    = info["captured_group_local_index"]       # (B, N2, 4) int32
+        stone_global_index             = info["stone_global_index"]               # (K,)   int32
+        stone_global_pointer           = info["stone_global_pointer"]             # (R+1,) int32
+        group_global_pointer_per_board = info["group_global_pointer_per_board"]   # (B+1,) int32
+        captured_group_local_index     = info["captured_group_local_index"]       # (B, N2, 4) int32
 
         # scalar sizes (keep as Python ints)
         R = int(stone_global_pointer.numel() - 1)
@@ -310,39 +309,28 @@ class TensorBoard(torch.nn.Module):
         opp_player          = 1 - current_player                     # (B,)
         opp_color_for_stone = opp_player[stone_board_index]          # (K,)
 
-        # stone_global_index is int32; convert once for indexing
-        stone_global_index_long = stone_global_index.long()
+        stone_global_index_long = stone_global_index.long()          # (K,)
 
         z_opp = z_by_color[opp_color_for_stone, stone_global_index_long]  # (K,)
         z_emp = z_empty_flat[stone_global_index_long]                     # (K,)
 
         # d_j = Z(opp at stone j) ^ Z(empty at stone j)
-        per_stone_delta = (z_opp ^ z_emp).to(torch.int32)                # (K,)
+        per_stone_delta = (z_opp ^ z_emp).to(torch.int32)                  # (K,)
 
         # ------------------------------------------------------------------ #
         # 4) Parallel prefix XOR over stones, then per-group XOR via CSR     #
         # ------------------------------------------------------------------ #
-        # We want, for each group g:
-        #   group_xor[g] = XOR_{j ∈ [start_g, end_g)} d_j
-        # Using an inclusive prefix scan:
-        #   prefix[i] = d0 ^ d1 ^ ... ^ di
-        #   XOR over [start, end) = prefix[end-1] ^ prefix[start-1]
-        #   (or just prefix[end-1] if start == 0)
-
-        # 4a) Inclusive prefix XOR (Hillis–Steele style) over K stones
+        # group_xor[g] = XOR_{j ∈ [start_g, end_g)} d_j
         prefix = per_stone_delta.clone()  # (K,)
         offset = 1
         while offset < K:
-            # IMPORTANT: read from a cloned snapshot to avoid aliasing
             prev = prefix.clone()         # (K,)
             prefix[offset:] ^= prev[:-offset]
             offset <<= 1
 
-        # 4b) Use CSR pointers to get per-group XOR
         start_idx = stone_global_pointer[:-1].long()  # (R,)
         end_idx   = stone_global_pointer[1:].long()   # (R,)
 
-        # inclusive indices for prefix
         end_pos   = end_idx - 1                       # (R,)
         start_pos = start_idx - 1                     # (R,)
 
@@ -367,7 +355,9 @@ class TensorBoard(torch.nn.Module):
         # Per-board group offsets (B,1,1)
         group_offset_per_board = group_global_pointer_per_board[:-1].view(B, 1, 1).long()
 
-        # 1) Global group ids in-place: offset + local ids
+        cap_vals = self._cap_vals  # alias
+
+        # 1) Local ids → global group ids
         cap_vals.copy_(captured_group_local_index.clamp_min(0))  # (B, N2, 4)
         cap_vals.add_(group_offset_per_board)                    # global group ids
 
@@ -399,7 +389,6 @@ class TensorBoard(torch.nn.Module):
         repeat_mask = self._repeat_mask_from_history(candidate_hashes, legal_mask)
         return legal_mask & ~repeat_mask
 
-
     # --------- shared helper: history repeat mask (deduped) ------------------ #
     @torch.no_grad()
     @timed_method
@@ -414,7 +403,7 @@ class TensorBoard(torch.nn.Module):
         B, H, W = legal_mask.shape
         M = self.hash_history.shape[1]
 
-        hash_history = self.hash_history                 # (B, M) int32
+        hash_history = self.hash_history
         moves_played = self.move_count.clamp_max(M).to(torch.long)  # (B,)
 
         INT32_MIN = torch.iinfo(torch.int32).min
@@ -428,7 +417,6 @@ class TensorBoard(torch.nn.Module):
         )
         sorted_history, _ = torch.sort(masked_history, dim=1)       # (B, M)
 
-        # Binary search; if not present, 'found' will differ from candidate_hash
         search_idx = (
             torch.searchsorted(sorted_history, candidate_hashes, right=True) - 1
         ).clamp_min(0)                                              # (B, N2)
@@ -445,6 +433,8 @@ class TensorBoard(torch.nn.Module):
         """
         Vectorized stone placement & capture using CSR.
         Uses precomputed per-group XOR deltas from the last legal() call.
+
+        positions: (B, 2) [row, col], negative row/col = pass.
         """
         dev = self.device
         B = self.batch_size
@@ -464,11 +454,11 @@ class TensorBoard(torch.nn.Module):
 
         # ---- Cached CSR + per-group deltas from last legal() ----
         info = self._last_info
-        captured_group_local_index = info["captured_group_local_index"]          # (B, N2, 4) int32
-        group_global_pointer_per_board = info["group_global_pointer_per_board"]  # (B+1,) int32
-        stone_global_pointer = info["stone_global_pointer"]                      # (R+1,) int32
-        stone_global_index = info["stone_global_index"]                          # (K,)   int32
-        group_xor_remove_delta = info["group_xor_remove_delta"].to(torch.int32)  # (R,)
+        captured_group_local_index     = info["captured_group_local_index"]          # (B, N2, 4) int32
+        group_global_pointer_per_board = info["group_global_pointer_per_board"]      # (B+1,) int32
+        stone_global_pointer           = info["stone_global_pointer"]                # (R+1,) int32
+        stone_global_index             = info["stone_global_index"]                  # (K,)   int32
+        group_xor_remove_delta         = info["group_xor_remove_delta"].to(torch.int32)  # (R,)
 
         # ---- Incremental Zobrist hash update: placement + captures ----
         Zpos = self.Zpos                                             # (N2, 3)
@@ -502,10 +492,9 @@ class TensorBoard(torch.nn.Module):
             captured_groups_flat = global_group_ids_4.view(-1)[flat_valid]       # (L,) int32
 
             group_start = stone_global_pointer[captured_groups_flat]             # (L,) int32
-            group_end = stone_global_pointer[captured_groups_flat + 1]           # (L,) int32
+            group_end   = stone_global_pointer[captured_groups_flat + 1]         # (L,) int32
             stones_per_group = (group_end - group_start)                         # (L,) int32
 
-            # Which board each captured group belongs to
             groups_per_move = valid_slots.sum(1).to(torch.long)                  # (M,)
             board_for_group = torch.repeat_interleave(
                 active_idx.to(torch.long), groups_per_move
@@ -544,50 +533,69 @@ class TensorBoard(torch.nn.Module):
         self.board[active_idx, rows, cols] = current_player.to(self.board.dtype)
 
     # ------------------------------------------------------------------ #
-    # History                                                            #
+    # Board history (board_history)                                      #
     # ------------------------------------------------------------------ #
     @timed_method
     def _update_board_history(self) -> None:
         """
-        Record current position:
-        - board_history: only for first up-to-16 boards (debug)
-        - hash_history : for all B boards
+        Record current board position into `board_history` for the first
+        tracked boards (debug only).
         """
+        # If history is disabled (max_moves == 0), do nothing
+        if self.board_history.numel() == 0:
+            return
+
         B = self.batch_size
-        H = W = self.board_size
+        dev = self.device
 
-        max_moves = self.board_history.shape[1] if self.board_history.numel() else 0
+        max_moves = self.board_history.shape[1]      # time axis length
+        board_flat = self.board.flatten(1)           # (B, H*W)
+        move_idx = self.move_count.to(torch.long)    # (B,)
 
-        # Flatten board once
-        board_flat = self.board.flatten(1)  # (B, H * W)
+        # Only write where move_idx < max_moves
+        valid = move_idx < max_moves                 # (B,)
+        if not valid.any():
+            return
 
-        # Per-board move index
-        move_idx = self.move_count.to(torch.long)  # (B,)
+        tracked_B = self._board_hist_track_B         # e.g. 16
 
-        # Debug snapshots (board_history)
-        if max_moves > 0:
-            valid_snapshot = (move_idx < max_moves)
-        else:
-            valid_snapshot = torch.zeros(B, dtype=torch.bool, device=self.device)
+        # Boards we care about: valid in time AND index < tracked_B
+        board_ids = torch.arange(B, device=dev)
+        mask = valid & (board_ids < tracked_B)
+        if not mask.any():
+            return
 
-        tracked_B = self._board_hist_track_B
-        if tracked_B > 0 and max_moves > 0:
-            all_boards = torch.arange(B, device=self.device)[valid_snapshot]
-            all_moves = move_idx[valid_snapshot]
-            track_mask = (all_boards < tracked_B)
-            if track_mask.any():
-                tracked_boards = all_boards[track_mask]
-                tracked_moves = all_moves[track_mask]
-                self.board_history[tracked_boards, tracked_moves] = board_flat[tracked_boards]
+        boards_to_write = board_ids[mask]            # (K,)
+        moves_to_write  = move_idx[mask]             # (K,)
 
-        # hash_history: write for all valid boards
-        if self.enable_super_ko:
-            max_moves_hash = self.hash_history.shape[1]
-            valid_hash = (move_idx < max_moves_hash)
-            if valid_hash.any():
-                board_idx = torch.arange(B, device=self.device)[valid_hash]
-                move_pos = move_idx[valid_hash]
-                self.hash_history[board_idx, move_pos] = self.current_hash[valid_hash]
+        self.board_history[boards_to_write, moves_to_write] = board_flat[boards_to_write]
+
+    # ------------------------------------------------------------------ #
+    # Hash history (hash_history) for super-ko                           #
+    # ------------------------------------------------------------------ #
+    @timed_method
+    def _update_hash_history(self) -> None:
+        """
+        Record current Zobrist hash into `hash_history` for super-ko.
+        """
+        if not self.enable_super_ko:
+            return
+        if self.hash_history.numel() == 0:
+            return
+
+        B = self.batch_size
+        dev = self.device
+
+        max_moves_hash = self.hash_history.shape[1]
+        move_idx = self.move_count.to(torch.long)        # (B,)
+        valid = move_idx < max_moves_hash                # (B,)
+        if not valid.any():
+            return
+
+        board_ids = torch.arange(B, device=dev)[valid]   # (K,)
+        moves_to_write = move_idx[valid]                 # (K,)
+
+        self.hash_history[board_ids, moves_to_write] = self.current_hash[valid]
 
     # ------------------------------------------------------------------ #
     # Game loop                                                          #
@@ -597,38 +605,34 @@ class TensorBoard(torch.nn.Module):
         """
         Execute one move for each game in the batch.
 
-        Parameters
-        ----------
         positions : (B, 2) tensor
-            Row, column coordinates. Negative values indicate pass.
+            [row, col] coordinates. Negative values indicate pass.
         """
         # Normalize input to the board's device (prevents mixed-device indexing)
         positions = positions.to(self.device, non_blocking=True)
 
-        if positions.dim() != 2 or positions.size(1) != 2:
-            raise ValueError("positions must be (B, 2)")
-        if positions.size(0) != self.batch_size:
-            raise ValueError(
-                f"batch size mismatch: expected {self.batch_size}, got {positions.size(0)}"
-            )
-
         # Which games are already over (two consecutive passes)?
         finished = (self.pass_count >= 2)
-        active = ~finished
+        active   = ~finished
 
         # Record history BEFORE the move
         self._update_board_history()
+        self._update_hash_history()
         self.move_count += 1
 
         # For finished games, force positions to "pass" so downstream is a no-op.
-        forced_pass = torch.full_like(positions, -1)
+        forced_pass    = torch.full_like(positions, -1)
         safe_positions = torch.where(finished.unsqueeze(1), forced_pass, positions)
 
         # Detect pass on the effective positions (active or forced)
         is_pass = (safe_positions[:, 0] < 0) | (safe_positions[:, 1] < 0)
 
         # Update pass_count ONLY for active games; clamp to 2 (terminal state stable).
-        inc_or_reset = torch.where(is_pass, self.pass_count + 1, torch.zeros_like(self.pass_count))
+        inc_or_reset = torch.where(
+            is_pass,
+            self.pass_count + 1,
+            torch.zeros_like(self.pass_count),
+        )
         new_pass_count = torch.where(active, inc_or_reset, self.pass_count).clamp_max(2)
         self.pass_count = new_pass_count
 
@@ -657,5 +661,4 @@ class TensorBoard(torch.nn.Module):
         black = (self.board == Stone.BLACK).sum((1, 2)).float()
         white = (self.board == Stone.WHITE).sum((1, 2)).float()
         return torch.stack([black, white], dim=1)
-
 

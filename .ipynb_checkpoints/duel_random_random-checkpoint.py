@@ -14,9 +14,8 @@ except Exception as e:
 """Minimal Go simulation driver with JSON history saving."""
 import time
 import torch
-from engine.tensor_native import TensorBoard
+from engine.board_tensor import TensorBoard
 from agents.basic import TensorBatchBot
-from interface.ascii import show
 from utils.shared import (
     select_device, 
     print_timing_report, 
@@ -28,7 +27,6 @@ def simulate_batch_games(
     num_games=512,
     board_size=9,
     history_factor=2,
-    show_boards=0,
     enable_super_ko=True,
     log_interval=10,
     enable_timing=True,
@@ -57,10 +55,13 @@ def simulate_batch_games(
         ply = 0
         print(f"Ply {ply:4d}: start")
         
-        while ply < board_size * board_size * history_factor:
+        while ply < 400 :
             finished = boards.is_game_over()
                 
             moves = bot.select_moves(boards)
+            if ply <= 3:
+                print(f"ply {ply} sample moves[0:3]:", moves[:3].cpu().tolist())
+
             boards.step(moves)
             ply += 1
 
@@ -74,6 +75,18 @@ def simulate_batch_games(
      
     elapsed = time.time() - t0
     print("time elasped:", elapsed)
+
+
+    #Go Game Results
+    scores = boards.compute_scores()
+    black_wins = (scores[:, 0] > scores[:, 1]).sum().cpu()
+    white_wins = (scores[:, 1] > scores[:, 0]).sum().cpu()
+    draws = num_games - black_wins - white_wins
+    
+    print(f"\nFinished in {elapsed:.2f}s ({ply} moves)")
+    print(f"Black wins: {black_wins} ({black_wins/num_games:.1%})")
+    print(f"White wins: {white_wins} ({white_wins/num_games:.1%})")
+    print(f"Draws: {draws} ({draws/num_games:.1%})")
     
 
     
@@ -84,10 +97,10 @@ def simulate_batch_games(
     # Timing
     if enable_timing:
         print_timing_report(boards)
-        print_timing_report(boards.legal_checker._checker)
+        print_timing_report(boards.legal_checker)
         print_performance_metrics(elapsed, ply, num_games)    
 
-
+    # Memory Performance
     MB = 1024 ** 2
     peak_alloc = torch.cuda.max_memory_allocated(device) / MB
     peak_res   = torch.cuda.max_memory_reserved(device) / MB
@@ -102,12 +115,10 @@ def simulate_batch_games(
 
 if __name__ == "__main__":
     simulate_batch_games(
-        num_games=2**12,
+        num_games=2**16,
         board_size=19,
         history_factor=3,
-        log_interval=2**4,
-        show_boards=2,
-        
+        log_interval=2**5,
         enable_timing=True,
         save_history=True,
         enable_super_ko=True,
