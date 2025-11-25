@@ -365,6 +365,118 @@ class GoLegalChecker:
 
         return parent
 
+
+
+    # ------------------------------------------------------------------
+    # Territory (Chinese area scoring: empty regions -> black/white/neutral)
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    @timed_method
+    def compute_territory(self, board: Tensor) -> Tensor:
+        """
+        Compute territory counts (empty points) for each colour using area scoring.
+
+        Args
+        ----
+        board : (B,H,W) int8
+            -1 = empty, 0 = black, 1 = white
+
+        Returns
+        -------
+        territory : (B,2) int32
+            territory[:,0] = black territory (empty points owned by black)
+            territory[:,1] = white territory (empty points owned by white)
+        """
+        B, H, W = board.shape
+        assert H == W == self.board_size, "board size mismatch"
+
+        N2 = self.N2
+        dev = board.device if self.device is None else self.device
+
+        # Flatten board once for this call
+        board_flatten = board.reshape(B, N2)               # (B,N2)
+        self.board_flatten = board_flatten                 # re-use neighbour helpers
+
+        # Empty points mask
+        empties = (board_flatten == -1)                    # (B,N2) bool
+
+        # If no empties at all, territory is zero
+        if not empties.any():
+            return torch.zeros((B, 2), dtype=torch.int32, device=dev)
+
+        # Neighbour colours (uses self.board_flatten)
+        neighbor_colors = self._get_neighbor_colors_batch()          # (B,N2,4) int8
+        neigh_valid_b = self.neigh_valid_flatten.view(1, N2, 4).expand(B, -1, -1)
+
+        # Union empty points into connected regions:
+        # edge between j and neighbour k if both are empty
+        same_region_edge = (
+            empties.unsqueeze(2) &
+            (neighbor_colors == -1) &
+            neigh_valid_b
+        )                                                         # (B,N2,4) bool
+
+        parent0 = torch.arange(N2, dtype=torch.int32, device=dev)
+        parent  = parent0.unsqueeze(0).repeat(B, 1).contiguous()  # (B,N2)
+        roots_all = self._hook_and_compress(parent, same_region_edge)  # (B,N2) int32
+
+        # Only care about empty cells
+        empty_batch_idx, empty_cell_idx = empties.nonzero(as_tuple=True)  # (E,), (E,)
+        if empty_batch_idx.numel() == 0:
+            return torch.zeros((B, 2), dtype=torch.int32, device=dev)
+
+        region_root = roots_all[empty_batch_idx, empty_cell_idx].to(torch.int64)  # (E,)
+
+        # Region key is (board_id, root_id) combined into a single index
+        region_key_empty = empty_batch_idx.to(torch.int64) * N2 + region_root     # (E,)
+
+        total_regions = B * N2
+
+        # Region size = number of empty points in that region
+        region_size_flat = torch.bincount(
+            region_key_empty,
+            minlength=total_regions,
+        ).to(torch.int32)                                                        # (B*N2,)
+
+        # For each empty point, look at neighbouring stones to determine
+        # whether the region touches black and/or white.
+        region_key_per_empty = region_key_empty                                  # (E,)
+        neighbor_colors_empty = neighbor_colors[empty_batch_idx, empty_cell_idx, :]  # (E,4)
+
+        # Expand region key per 4 neighbours
+        region_key_tile = region_key_per_empty.repeat_interleave(4)              # (E*4,)
+        colors_flat = neighbor_colors_empty.reshape(-1)                          # (E*4,)
+
+        is_black = (colors_flat == 0)
+        is_white = (colors_flat == 1)
+
+        has_black_flat = torch.zeros(total_regions, dtype=torch.bool, device=dev)
+        has_white_flat = torch.zeros(total_regions, dtype=torch.bool, device=dev)
+
+        if is_black.any():
+            black_keys = region_key_tile[is_black]
+            has_black_flat[black_keys] = True
+
+        if is_white.any():
+            white_keys = region_key_tile[is_white]
+            has_white_flat[white_keys] = True
+
+        # Classification per region: black-only, white-only, or neutral (dame)
+        black_only = has_black_flat & ~has_white_flat
+        white_only = has_white_flat & ~has_black_flat
+
+        # Territory per region = region_size if owned, else 0
+        zero_like = torch.zeros_like(region_size_flat)
+        black_territory_flat = torch.where(black_only, region_size_flat, zero_like)
+        white_territory_flat = torch.where(white_only, region_size_flat, zero_like)
+
+        # Sum per board
+        black_territory = black_territory_flat.view(B, N2).sum(dim=1)  # (B,)
+        white_territory = white_territory_flat.view(B, N2).sum(dim=1)  # (B,)
+
+        return torch.stack([black_territory, white_territory], dim=1)  # (B,2)
+
+
     # ------------------------------------------------------------------
     # Build CSR + LUTs (global across batch; safe for K=0)
     # ------------------------------------------------------------------
