@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
+#engine/go_legal_checker.py
 """
-go_legal_checker.py – batched Go rules engine (board-plane + CSR captures)
+batched Go rules engine (board-plane + CSR captures)
 ===========================================================================
 
 Board
 -----
-- board: (B, H, W) int8 with values: -1 empty, 0 black, 1 white
+- board: (B, H, W) int8 with values: Stone.EMPTY, Stone.BLACK, Stone.WHITE
+  # current encoding: EMPTY=-1, BLACK=0, WHITE=1
+  
 - Internally we work on a flattened grid: N2 = H * W
 
 CSR nomenclature
@@ -25,8 +28,8 @@ class GoLegalChecker:
 
     def compute_batch_legal_and_info(
         self,
-        board: torch.Tensor,          # (B,H,W) int8 in {-1,0,1}
-        current_player: torch.Tensor, # (B,)    uint8/int8 in {0,1}
+        board: Tensor,          # (B,H,W) int8 in {Stone.EMPTY, Stone.BLACK, Stone.WHITE}
+        move_color: Tensor,    # (B,)    int8, Stone.BLACK or Stone.WHITE
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]
 
 Returns:
@@ -41,6 +44,23 @@ import torch
 from torch import Tensor
 
 from utils.shared import timed_method
+
+# ------------------------------------------------------------------
+# Stone + sentinel constants (CURRENT ENCODING)
+# ------------------------------------------------------------------
+
+
+from .stones import Stone  
+
+
+# neighbour_colors special value for off-board
+OFF_BOARD_COLOR = -2
+
+# sentinel indices for "nothing here"
+NO_ROOT    = -1
+NO_GROUP   = -1
+NO_CAPTURE = -1
+
 
 
 class GoLegalChecker:
@@ -119,8 +139,8 @@ class GoLegalChecker:
     @timed_method
     def compute_batch_legal_and_info(
         self,
-        board: Tensor,          # (B,H,W) int8 in {-1,0,1}
-        current_player: Tensor  # (B,)    uint8/int8 in {0,1}
+        board: Tensor,          # (B,H,W) int8 in {Stone.EMPTY, Stone.BLACK, Stone.WHITE}
+        move_color: Tensor,    # (B,)    int8, Stone.BLACK or Stone.WHITE
     ) -> Tuple[Tensor, Dict[str, Tensor]]:
         B, H, W = board.shape
         N2 = self.N2
@@ -128,7 +148,8 @@ class GoLegalChecker:
 
         # Per-call runtime flatten (depends on B)
         self.board_flatten = board.reshape(B, N2)       # (B,N2)
-        empty = (self.board_flatten == -1)              # (B,N2) bool
+        empty = (self.board_flatten == Stone.EMPTY)     # (B,N2) bool
+
 
         # ---- Neighbour colours: compute ONCE per call and reuse ----------
         neighbor_colors = self._get_neighbor_colors_batch()  # (B,N2,4)
@@ -148,12 +169,18 @@ class GoLegalChecker:
         neigh_valid_flatten_b = self.neigh_valid_flatten.view(1, N2, 4).expand(B, -1, -1)
         neighbor_roots = self._get_neighbor_roots_batch(roots)  # (B,N2,4) int32
 
-        curr = current_player.view(B, 1, 1)  # (B,1,1)
-        opp = 1 - curr
+        # colour-of-move
+        curr = move_color.view(B, 1, 1)          # (B,1,1), Stone.*
+        # explicit opposite colour, no "1 - curr" hack
+        opp = torch.where(
+            curr == Stone.BLACK,
+            torch.full_like(curr, Stone.WHITE),
+            torch.full_like(curr, Stone.BLACK),
+        )
 
         # A) immediate liberties – at least one empty neighbour
         has_any_lib = (
-            (neighbor_colors == -1) & neigh_valid_flatten_b
+            (neighbor_colors == Stone.EMPTY) & neigh_valid_flatten_b
         ).any(dim=2)  # (B,N2)
 
         # B) captures: adjacent opponent group with exactly 1 liberty
@@ -184,7 +211,7 @@ class GoLegalChecker:
         captured_group_local_index = torch.where(
             can_capture_edge,
             captured_group_local_index_all,
-            torch.full_like(captured_group_local_index_all, -1, dtype=torch.int32),
+            torch.full_like(captured_group_local_index_all, NO_CAPTURE, dtype=torch.int32),
         )                                                                        # (B,N2,4) int32
 
         # info payload (no (B,N2,N2) tensors; use CSR + per-candidate gids)
@@ -233,9 +260,10 @@ class GoLegalChecker:
         # Same-colour adjacency (ignore empties; respect edges)
         same_color_neighbor = (
             (neighbor_colors == board_flatten.unsqueeze(2))
-            & (board_flatten.unsqueeze(2) != -1)
+            & (board_flatten.unsqueeze(2) != Stone.EMPTY)
             & neigh_valid_flatten_b
-        )  # (B,N2,4)
+        )
+
 
         # Hook & compress (union-find)
         parent0 = torch.arange(N2, dtype=torch.int32, device=dev)
@@ -245,8 +273,8 @@ class GoLegalChecker:
         roots = parent                                                          # (B,N2) int32
 
         # Count unique liberties per root
-        is_liberty_edge = (neighbor_colors == -1) & neigh_valid_flatten_b       # (B,N2,4)
-        has_stone = (board_flatten != -1)                                       # (B,N2)
+        is_liberty_edge = (neighbor_colors == Stone.EMPTY) & neigh_valid_flatten_b  # (B,N2,4)
+        has_stone = (board_flatten != Stone.EMPTY)                                  # (B,N2)
         stone_to_liberty_edge_mask = is_liberty_edge & has_stone.unsqueeze(2)   # (B,N2,4)
 
         # K = number of stone→empty edges across the batch
@@ -379,7 +407,7 @@ class GoLegalChecker:
         Args
         ----
         board : (B,H,W) int8
-            -1 = empty, 0 = black, 1 = white
+        Values are Stone.EMPTY, Stone.BLACK, Stone.WHITE
 
         Returns
         -------
@@ -398,7 +426,7 @@ class GoLegalChecker:
         self.board_flatten = board_flatten                 # re-use neighbour helpers
 
         # Empty points mask
-        empties = (board_flatten == -1)                    # (B,N2) bool
+        empties = (board_flatten == Stone.EMPTY)           # (B,N2) bool
 
         # If no empties at all, territory is zero
         if not empties.any():
@@ -412,7 +440,7 @@ class GoLegalChecker:
         # edge between j and neighbour k if both are empty
         same_region_edge = (
             empties.unsqueeze(2) &
-            (neighbor_colors == -1) &
+            (neighbor_colors == Stone.EMPTY) &
             neigh_valid_b
         )                                                         # (B,N2,4) bool
 
@@ -447,8 +475,8 @@ class GoLegalChecker:
         region_key_tile = region_key_per_empty.repeat_interleave(4)              # (E*4,)
         colors_flat = neighbor_colors_empty.reshape(-1)                          # (E*4,)
 
-        is_black = (colors_flat == 0)
-        is_white = (colors_flat == 1)
+        is_black = (colors_flat == Stone.BLACK)
+        is_white = (colors_flat == Stone.WHITE)
 
         has_black_flat = torch.zeros(total_regions, dtype=torch.bool, device=dev)
         has_white_flat = torch.zeros(total_regions, dtype=torch.bool, device=dev)
@@ -493,8 +521,8 @@ class GoLegalChecker:
         # Grow CSR workspaces if needed (only on first use / if B, N2 changed)
         if self._csr_capacity_K < maxK:
             self._csr_sg = torch.empty(maxK, dtype=torch.int32, device=dev)
-            self._csr_slc = torch.full((B, N2), -1, dtype=torch.int32, device=dev)
-            self._csr_slr = torch.full((B, N2), -1, dtype=torch.int32, device=dev)
+            self._csr_slc = torch.full((B, N2), NO_GROUP, dtype=torch.int32, device=dev)
+            self._csr_slr = torch.full((B, N2), NO_GROUP, dtype=torch.int32, device=dev)
             self._csr_capacity_K = maxK
 
         if self._csr_capacity_R < maxR:
@@ -503,7 +531,7 @@ class GoLegalChecker:
             self._csr_capacity_R = maxR
 
         # 1) take stones (exclude empties)
-        has_stone = (self.board_flatten != -1)                     # (B,N2)
+        has_stone = (self.board_flatten != Stone.EMPTY)   # (B,N2)
         stone_batch_idx, stone_cell_idx = has_stone.nonzero(as_tuple=True)  # (K,), (K,)
         stone_root_idx = roots[stone_batch_idx, stone_cell_idx]    # (K,) int32
 
@@ -565,7 +593,7 @@ class GoLegalChecker:
             stone_global_pointer[1:R+1] = stones_per_group.cumsum(0)
 
         stone_local_index_from_cell = self._csr_slc   # (B,N2)
-        stone_local_index_from_cell.fill_(-1)
+        stone_local_index_from_cell.fill_(NO_GROUP)
         if K > 0:
             lin_cells = (b_sorted.to(torch.int64) * N2 + j_sorted.to(torch.int64))    # (K,)
             stone_local_index_from_cell.view(-1).index_put_(
@@ -575,7 +603,7 @@ class GoLegalChecker:
             )
 
         stone_local_index_from_root = self._csr_slr   # (B,N2)
-        stone_local_index_from_root.fill_(-1)
+        stone_local_index_from_root.fill_(NO_GROUP)
         if R > 0:
             root_id_for_run = r_sorted[group_start_indices]                       # (R,)
             lin_roots = (
@@ -607,10 +635,10 @@ class GoLegalChecker:
         -------
         neighbour_colors : (B,N2,4) int8
             For each board, cell, direction (N,S,W,E):
-            - -2  : off-board
-            - -1  : empty
-            -  0  : black stone
-            -  1  : white stone
+            OFF_BOARD_COLOR  : off-board
+            Stone.EMPTY      : empty
+            Stone.BLACK      : black stone
+            Stone.WHITE      : white stone
         """
         B, N2 = self.board_flatten.shape
 
@@ -623,12 +651,13 @@ class GoLegalChecker:
         out = torch.gather(board3, dim=1, index=idx).to(torch.int8)             # (B,N2,4) int8
 
         # Mark off-board neighbours distinctly
-        out.masked_fill_(~valid, -2)
+        out.masked_fill_(~valid, OFF_BOARD_COLOR)
+
         return out
 
     @timed_method
     def _get_neighbor_roots_batch(self, roots: Tensor) -> Tensor:
-        """Return neighbour union-find roots using precomputed non-negative indices; off-board = -1.
+        """Return neighbour union-find roots using precomputed non-negative indices; off-board = off-board = NO_ROOT -1.
 
         Returns
         -------
@@ -642,6 +671,6 @@ class GoLegalChecker:
 
         roots3 = roots.unsqueeze(2).expand(-1, -1, 4)                             # (B,N2,4) view
         gathered = torch.gather(roots3, dim=1, index=idx)                         # (B,N2,4) int32
-        gathered.masked_fill_(~valid, -1)
+        gathered.masked_fill_(~valid, NO_ROOT)
         return gathered
-
+#-----end of go_legal_checker.py------------

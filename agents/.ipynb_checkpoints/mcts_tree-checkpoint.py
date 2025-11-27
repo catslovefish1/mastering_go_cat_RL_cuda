@@ -6,17 +6,17 @@ import torch
 from torch import Tensor
 
 if TYPE_CHECKING:
-    from engine.board_physics import GoEnginePhysics
+    from engine.game_state_machine import GameStateMachine
 
 
 class MCTSTreeIndexInfo:
     """
     Bundled MCTS tree state for a batched Go position.
 
-    Construct directly from a virtual search engine:
+    Construct directly from a virtual GameStateMachine:
 
         tree = MCTSTreeIndexInfo(
-            engine=search_engine,
+            engine=search_game_state_machine,
             max_nodes=1024,
             max_depth=256,
         )
@@ -24,7 +24,7 @@ class MCTSTreeIndexInfo:
     or via the plain helper:
 
         tree = build_mcts_tree_from_engine_data(
-            engine=search_engine,
+            engine=search_game_state_machine,
             max_nodes=1024,
             max_depth=256,
         )
@@ -32,11 +32,11 @@ class MCTSTreeIndexInfo:
 
     def __init__(
         self,
-        engine: "GoEnginePhysics",
+        engine: "GameStateMachine",
         max_nodes: int,    # == max_budget per board
         max_depth: int,    # selection depth limit
     ):
-        # -------- infer shape & device from engine --------
+        # -------- infer shape & device from GameStateMachine --------
         boards = engine.boards          # (B,H,W)
         to_play = engine.to_play        # (B,)
 
@@ -95,7 +95,7 @@ class MCTSTreeIndexInfo:
         self.Q: Tensor = torch.zeros(
             (self.B, self.M), dtype=torch.float32, device=self.device
         )
-        
+
         # per-action prior (policy) and legal mask
         self.P: Tensor = torch.zeros(
             (self.B, self.M, self.A),
@@ -119,26 +119,20 @@ class MCTSTreeIndexInfo:
         self.is_terminal[:, 0] = False
         self.to_play[:, 0] = to_play.to(torch.int8)
 
-    @property
-    def root_index(self) -> int:
-        return 0
-
-    @property
-    def BxM(self) -> int:
-        return self.B * self.M
 
 
 def build_mcts_tree_from_engine_data(
-    engine: "GoEnginePhysics",
+    engine: "GameStateMachine",
     max_nodes: int,
     max_depth: int,
 ) -> MCTSTreeIndexInfo:
     """
     Simple, non-magic helper:
-    eat engine + params, return a fully-built tree object.
+    eat GameStateMachine + params, return a fully-built tree object.
     """
     return MCTSTreeIndexInfo(
         engine=engine,
         max_nodes=max_nodes,
         max_depth=max_depth,
     )
+

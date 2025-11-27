@@ -4,25 +4,25 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from engine.board_physics import GoEnginePhysics
-from engine.board_state import GoBatchState
+from engine.game_state_machine import GameStateMachine
+from engine.game_state import GameState
 from .mcts_tree import MCTSTreeIndexInfo
 
 
 @torch.no_grad()
 def run_mcts_random_root(
     tree: MCTSTreeIndexInfo,
-    engine: GoEnginePhysics,
+    game_state_machine: GameStateMachine,
     num_simulations: int,   # ignored for now
     komi: float = 0.0,
     debug: bool = False,
 ) -> Tensor:
     """
-    Greedy root search using compute_scores, but fully batched:
+    Greedy root search using compute_scores on a GameStateMachine, fully batched:
 
       - Build legal actions at root for all games.
       - Collect all legal (b,a) pairs into a single big batch of size K.
-      - Clone those K root states into a batched GoEnginePhysics.
+      - Clone those K root states into a batched GameStateMachine.
       - Apply all K moves in parallel.
       - Call compute_scores() once on that batch.
       - Convert scores to values v in {-1,0,+1} from root player's POV.
@@ -32,14 +32,18 @@ def run_mcts_random_root(
     -------
     actions : (B,) long
         0 .. H*W-1  => board points
-        H*W        => pass
-    """
-    # --- 1) legal mask at the root (on the VIRTUAL engine) ---
-    legal_mask_2d = engine.legal_moves()  # (B, H, W) bool
-    B, H, W = legal_mask_2d.shape
-    assert H == W == tree.board_size, "Tree and engine board sizes must match"
+        H*W         => pass
+    """ 
 
-    dev = engine.device
+
+
+    
+    # --- 1) legal mask at the root (on the VIRTUAL GameStateMachine) ---
+    legal_mask_2d = game_state_machine.legal_moves()  # (B, H, W) bool
+    B, H, W = legal_mask_2d.shape
+    assert H == W == tree.board_size, "Tree and GameStateMachine board sizes must match"
+
+    dev = game_state_machine.device
     A = tree.A
     root = tree.root_index
     pass_idx = H * W
@@ -74,18 +78,21 @@ def run_mcts_random_root(
         return actions
 
     # --- 3) build batched root states for those K pairs ---
-    boards_eval       = engine.boards[b_idx].clone()        # (K, H, W)
-    to_play_eval      = engine.to_play[b_idx].clone()       # (K,)
-    pass_count_eval   = engine.pass_count[b_idx].clone()    # (K,)
-    zobrist_hash_eval = engine.zobrist_hash[b_idx].clone()  # (K, 2)
+    boards_eval       = game_state_machine.boards[b_idx].clone()        # (K, H, W)
+    to_play_eval      = game_state_machine.to_play[b_idx].clone()       # (K,)
+    print("[MCTS_ROOT][debug] to_play_eval_is_about_to_print")
+    print("[MCTS_ROOT][debug] to_play_eval (first 32):",
+          to_play_eval[0:3].cpu().tolist())
+    pass_count_eval   = game_state_machine.pass_count[b_idx].clone()    # (K,)
+    zobrist_hash_eval = game_state_machine.zobrist_hash[b_idx].clone()  # (K, 2)
 
-    state_eval = GoBatchState(
+    state_eval = GameState(
         boards=boards_eval,
         to_play=to_play_eval,
         pass_count=pass_count_eval,
         zobrist_hash=zobrist_hash_eval,
     )
-    engine_eval = GoEnginePhysics(state_eval)
+    game_state_machine_eval = GameStateMachine(state_eval)
 
     # --- 4) build moves for each (b,a) ---
     rows = a_idx // H
@@ -97,13 +104,36 @@ def run_mcts_random_root(
     moves_eval[is_pass] = -1
 
     # apply all moves in parallel
-    engine_eval.state_transition(moves_eval)
+    game_state_machine_eval.state_transition(moves_eval)
+
+    
 
     # --- 5) score all K successor states in parallel ---
-    scores_eval = engine_eval.compute_scores(komi=komi)  # (K,2) float
+    # scores_eval = game_state_machine_eval.compute_scores(komi=komi)  # (K,2) float
 
-    # values from root player's perspective
-    root_players = to_play_eval.to(torch.long)  # (K,) 0=black,1=white
+    # # values from root player's perspective
+    # root_players = to_play_eval.to(torch.long)  # (K,) 0=black,1=white
+
+    # # <<< DEBUG PRINT HERE >>>
+    # print("[MCTS_ROOT][debug] root_player_is_about_to_print")
+    # print("[MCTS_ROOT][debug] root_players (first 32):",
+    #       root_players[:].cpu().tolist())
+
+    scores_eval = game_state_machine_eval.compute_scores(komi=komi)  # (K,2) float
+    # values from ROOT player's perspective
+    # Use the engine's current .to_play and index by b_idx → cannot drift.
+    root_to_play_full = game_state_machine.to_play.to(torch.long)  # (B,)
+    root_players = root_to_play_full[b_idx]                        # (K,) 0=black,1=white
+    other = 1 - root_players
+    
+    if debug:
+        print("[MCTS_ROOT][debug] engine.to_play unique:",
+              torch.unique(game_state_machine.to_play).cpu().tolist())
+        print("[MCTS_ROOT][debug] root_players unique:",
+              torch.unique(root_players).cpu().tolist())
+        print("[MCTS_ROOT][debug] root_players (first 32):",
+              root_players[:32].cpu().tolist())
+
     other = 1 - root_players
 
     arange_K = torch.arange(K, device=dev)
@@ -199,5 +229,3 @@ def run_mcts_random_root(
             )
 
     return actions
-
-

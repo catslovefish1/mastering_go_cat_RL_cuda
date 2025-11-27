@@ -32,9 +32,9 @@ class Stone:
     EMPTY: int = -1
 
 
-BoardTensor = Tensor     # (B, H, W)
-PositionTensor = Tensor  # (B, 2)
-PassTensor = Tensor      # (B,)
+    BoardTensor = Tensor     # (B, H, W)
+    PositionTensor = Tensor  # (B, 2)
+    PassTensor = Tensor      # (B,)
 
 
 # ========================= GO ENGINE =========================================

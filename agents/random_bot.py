@@ -6,12 +6,12 @@ from typing import Optional  # you can actually delete this now
 import torch
 from torch import Tensor
 
-from engine.board_physics import GoEnginePhysics
+from engine.game_state_machine import GameStateMachine
 
 
 class RandomBot:
     """
-    Go bot that works directly with GoEnginePhysics:
+    Go bot that works directly with GameStateMachine:
     - Asks engine.legal_moves() for a (B, H, W) legal mask.
     - Samples one legal move uniformly per game.
     - Returns [-1, -1] when no legal moves (pass).
@@ -22,11 +22,11 @@ class RandomBot:
         pass
 
     @torch.no_grad()
-    def select_moves(self, engine: GoEnginePhysics) -> Tensor:
+    def select_moves(self, game_state_machine: GameStateMachine) -> Tensor:
         """
         Args
         ----
-        engine : GoEnginePhysics
+        engine : GameStateMachine
             The engine holding the current batched state.
 
         Returns
@@ -35,9 +35,9 @@ class RandomBot:
             (row, col) per game; (-1, -1) for pass.
         """
         # 1) get legal mask from engine; also primes internal caches
-        legal_mask = engine.legal_moves()   # (B,H,W) bool
+        legal_mask = game_state_machine.legal_moves()   # (B,H,W) bool
         B, H, W = legal_mask.shape
-        dev = engine.device                 # inherit device from state / engine
+        dev = game_state_machine.device                 # inherit device from state / engine
 
         # 2) start with all passes
         moves = torch.full((B, 2), -1, dtype=torch.long, device=dev)

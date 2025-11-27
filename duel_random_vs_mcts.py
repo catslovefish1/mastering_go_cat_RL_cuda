@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# duel_random_vs_mtcs.py – random-vs-random using GoEnginePhysics + debug history
+# duel_random_vs_mcts.py – random-vs-MCTS using GameStateMachine + debug history
 
 from __future__ import annotations
 
@@ -7,21 +7,22 @@ import os
 import time
 import signal
 
-print(f"[PID {os.getpid()}] duel_random_physics start", flush=True)
+from pprint import pprint
 
-try:
-    import faulthandler
-    faulthandler.register(signal.SIGUSR1)
-    faulthandler.dump_traceback_later(60, repeat=True)
-except Exception as e:
-    print(f"[warn] faulthandler setup failed: {e}", flush=True)
+print(f"[PID {os.getpid()}] duel_random_vs_mcts start", flush=True)
+
 
 import torch
 
-from engine.board_state import create_empty_batch
-from engine.board_physics import GoEnginePhysics   # the REAL physics engine
+from engine.game_state import create_empty_game_state
+from engine.game_state_machine import GameStateMachine   # the REAL physics engine
 from agents.random_bot import RandomBot
 from agents.mcts_bot   import MCTSBot
+
+from utils.game_history import GameHistory
+from utils.save_debug_history_minimal import save_debug_games_minimal
+
+
 
 from utils.shared import (
     select_device,
@@ -29,12 +30,6 @@ from utils.shared import (
     print_performance_metrics,
 )
 
-from utils.board_history_tracker import (
-    init_move_history,
-    snapshot_pre_move,
-    record_move_history,
-    save_per_game_histories,
-)
 
 
 def simulate_batch_games_with_history(
@@ -48,134 +43,110 @@ def simulate_batch_games_with_history(
     history_dir: str = "debug_games",
 ):
     device = select_device()
-    print(f"Running {num_games} games on {board_size}×{board_size} ({device})")
+    print("Hello World, random_vs_mcts", f"Running {num_games} games on {board_size}×{board_size} ({device})")
 
     # ------------------------------------------------------------------
-    # 1) REAL WORLD: create empty batch + real physics engine + bots
+    # Intialize game state state = 0
     # ------------------------------------------------------------------
-    real_state = create_empty_batch(
+
+    
+    real_state = create_empty_game_state(
         batch_size=num_games,
         board_size=board_size,
         device=device,
     )
-    # This is the *physical* Go engine that actually mutates boards,
-    # pass_count, zobrist_hash, etc.
-    real_engine = GoEnginePhysics(real_state)
+
+    real_state_machine = GameStateMachine(real_state)
+
+
+
+    B_tracked = num_games  # or num_games_to_save if you want
+
+    game_history = GameHistory(
+        T_max=max_plies,
+        B_tracked=B_tracked,
+        H=board_size,
+        device=device,
+    )
 
     # Two bots
-    random_bot_0 = RandomBot()   # conceptually "Player 0 / Black"
-    # max_nodes means max_budge here to build mcts_tree
-    MCTSBot_1 = MCTSBot(max_nodes=512, max_depth=256, num_simulations=10)
+    bot_A = RandomBot() 
+    bot_B = MCTSBot(max_nodes=512, max_depth=256, num_simulations=10)
 
-    # unify: num_games_to_save drives both tracking and JSON outputs
-    num_games_to_save = min(num_games_to_save, num_games)
 
-    # history container for first G games
-    move_history = init_move_history(num_games_to_save)
+    # t = 0 state
+    game_history.boards[:,0].copy_(real_state_machine.boards[:B_tracked])
+    game_history.to_play[:,0].copy_(real_state_machine.to_play[:B_tracked])
+    game_history.hashes[:,0].copy_(real_state_machine.zobrist_hash[:B_tracked, 0])
+
+    # game_history 
 
     t0 = time.time()
     ply = 0
 
     LAST_PLY = max_plies - 1  # e.g. 299 if max_plies = 300
+    print("LAST_PLY", LAST_PLY)
 
     with torch.no_grad():
         while ply < max_plies:
-            finished = real_engine.is_game_over()
-            if finished.all():
-                print(f"All games finished by ply {ply}.")
-                break
-    
-            boards_before, to_play_before, hash_before = snapshot_pre_move(
-                real_engine, num_games_to_save
-            )
-    
+
+            print(f"Ply {ply:4d}: started")
+
+
             # --- choose which bot based on ply ---
-            if ply < LAST_PLY:
+            if ply < max_plies-1:
                 # all earlier moves: pure random
-                moves = random_bot_0.select_moves(real_engine)
+                moves = bot_A.select_moves(real_state_machine)
             else:
-                # last move: use MCTS
-                moves = MCTSBot_1.select_moves(real_engine)
-    
-            if ply <= 3:
-                print(f"ply {ply} sample moves[0:3]:", moves[:3].cpu().tolist())
-    
-            real_engine.state_transition(moves)
+                moves = bot_B.select_moves(real_state_machine)
 
-            # --- snapshot AFTER the move hash (REAL zobrist) ---
-            hash_after = real_engine.zobrist_hash[:, 0].clone()  # (B,)
+            game_history.moves[:, ply].copy_(moves[:B_tracked])
 
-            # --- 4) record history for first G games ---
-            record_move_history(
-                move_history=move_history,
-                ply=ply,
-                moves=moves,
-                boards_before=boards_before,
-                to_play_before=to_play_before,
-                hash_before=hash_before,
-                hash_after=hash_after,
-                num_games_to_save=num_games_to_save,
-            )
+
+            real_state_machine.state_transition(moves)
+
+
+            # record next state
+            game_history.boards[:, ply + 1].copy_(real_state_machine.boards[:B_tracked])
+            game_history.to_play[:, ply + 1].copy_(real_state_machine.to_play[:B_tracked])
+            game_history.hashes[:, ply + 1].copy_(real_state_machine.zobrist_hash[:B_tracked, 0])
+        
 
             ply += 1
+                       
 
-            if log_interval and (ply % log_interval == 0):
-                finished = real_engine.is_game_over()
-                finished_count = int(finished.sum().item())
-                print(f"Ply {ply:4d}: {finished_count}/{num_games} finished")
+    outcome_ratios= real_state_machine.outcome_ratios(komi=komi)
+    print("about_to_print_outcome_ratio")
+    print(outcome_ratios)
+    scores = real_state_machine.compute_scores(komi=komi)       # (B,2)
+    print(scores[0:4])
+    finished_flags = real_state_machine.is_game_over()          # (B,)
+    win_or_loss = real_state_machine.game_outcomes(komi=komi) 
+    
 
-    elapsed = time.time() - t0
-    print(f"\nFinished in {elapsed:.2f}s ({ply} plies simulated)")
-
-    # --- final scoring on the REAL boards ---
-    scores = real_engine.compute_scores(komi=komi)       # (B,2) float
-    final_hashes = real_engine.zobrist_hash[:, 0]        # (B,) int32
-    finished_flags = real_engine.is_game_over()          # (B,) bool
-
-    black_wins = (scores[:, 0] > scores[:, 1]).sum().item()
-    white_wins = (scores[:, 1] > scores[:, 0]).sum().item()
-    draws = num_games - black_wins - white_wins
-
-    print(f"Black wins: {black_wins} ({black_wins/num_games:.1%})")
-    print(f"White wins: {white_wins} ({white_wins/num_games:.1%})")
-    print(f"Draws     : {draws} ({draws/num_games:.1%})")
-
-    # --- save per-game JSON histories for first num_games_to_save games ---
-    save_per_game_histories(
-        base_dir=history_dir,
-        move_history=move_history,                       # len = num_games_to_save
-        scores=scores[:num_games_to_save],
-        final_hashes=final_hashes[:num_games_to_save],
-        finished_flags=finished_flags[:num_games_to_save],
-        board_size=board_size,
-        max_plies=max_plies,
+    game_history.finalize(
+        num_plies=max_plies,
+        finished=finished_flags[:B_tracked],
+        scores=scores[:B_tracked],
+        win_or_loss = win_or_loss[:B_tracked]
     )
 
-    # --- timing ---
-    if enable_timing:
-        print_timing_report(real_engine)
-        print_timing_report(real_engine.legal_checker)
-        print_performance_metrics(elapsed, ply, num_games)
-
-    # --- GPU memory (CUDA only) ---
-    if device.type == "cuda":
-        MB = 1024 ** 2
-        peak_alloc = torch.cuda.max_memory_allocated(device) / MB
-        peak_res   = torch.cuda.max_memory_reserved(device) / MB
-        cur  = torch.cuda.memory_allocated(device) / MB
-        res  = torch.cuda.memory_reserved(device) / MB
-        print(f"[CUDA][FINAL] current={cur:.1f} MB reserved={res:.1f} MB")
-        print(f"[CUDA][FINAL] peak_alloc={peak_alloc:.1f} MB peak_reserved={peak_res:.1f} MB")
+    save_debug_games_minimal(
+        history=game_history,
+        out_dir=history_dir,
+        num_games_to_save=num_games_to_save,
+    )
+    
 
 
 if __name__ == "__main__":
     simulate_batch_games_with_history(
-        num_games=2**12,
+        num_games=2**6,
+        num_games_to_save=2**2,  #to_json
         board_size=9,
-        max_plies=500,
+        max_plies=100,
         komi=0,
         log_interval=128,
         enable_timing=True,
-        num_games_to_save=4,
         history_dir="debug_games",
     )

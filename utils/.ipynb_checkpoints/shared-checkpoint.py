@@ -270,83 +270,9 @@ def print_section_header(title: str, width: int = 80) -> None:
     print("=" * width)
 
 
-def print_union_find_grid(board, batch_idx: int = 0, column: int = 0) -> None:
-    """Print union-find data in grid format.
-
-    Args:
-        board: Object with `board_size` and `flatten_union_find`.
-        batch_idx: Batch index to print.
-        column: 0=Colour, 1=Parent, 2=Liberty.
-    """
-    column_names = ["Colour", "Parent", "Liberty"]
-    print(f"\n{column_names[column]} values for batch {batch_idx}:")
-    print("-" * (board.board_size * 4 + 1))
-
-    uf_data = board.flatten_union_find[batch_idx, :, column].view(
-        board.board_size, board.board_size
-    )
-
-    for row in range(board.board_size):
-        row_str = "|"
-        for col in range(board.board_size):
-            value = uf_data[row, col].item()
-            row_str += f"{value:3}|"
-        print(row_str)
-    print("-" * (board.board_size * 4 + 1))
 
 
-def print_all_union_find_columns(
-    board,
-    batch_idx: int = 0,
-    board_size_limit: int = 9,
-) -> None:
-    """Print all union-find columns with appropriate formatting.
 
-    Always prints colour; parent/liberty only for small boards.
-    """
-    print("\nCOLOUR (-1=empty, 0=black, 1=white):")
-    print_union_find_grid(board, batch_idx, column=0)
-
-    if board.board_size <= board_size_limit:
-        print("\nPARENT INDICES:")
-        print_union_find_grid(board, batch_idx, column=1)
-
-        print("\nLIBERTY COUNTS:")
-        print_union_find_grid(board, batch_idx, column=2)
-
-
-def print_move_info(move: Tensor, player: int) -> None:
-    """Print information about a move."""
-    player_name = "BLACK" if player == 0 else "WHITE"
-    print(f"\nCurrent player: {player_name} ({player})")
-    print(f"Move to be played: {move.tolist()}")
-
-    if move[0] >= 0:  # Not a pass
-        print(f"  Position: row={move[0].item()}, col={move[1].item()}")
-    else:
-        print("  PASS MOVE")
-
-
-def print_game_state(
-    board,
-    batch_idx: int = 0,
-    ply: int = 0,
-    header: str = "",
-    move: Optional[Tensor] = None,
-) -> None:
-    """Print complete game state for debugging."""
-    print_section_header(f"{header} - Ply {ply}")
-
-    if move is not None:
-        print_move_info(move, board.current_player[batch_idx].item())
-
-    print_all_union_find_columns(board, batch_idx)
-
-    print(f"\nPass count: {board.pass_count[batch_idx].item()}")
-    if hasattr(board, "ko_points") and board.ko_points[batch_idx, 0] >= 0:
-        ko_row = board.ko_points[batch_idx, 0].item()
-        ko_col = board.ko_points[batch_idx, 1].item()
-        print(f"Ko point: ({ko_row}, {ko_col})")
 
 
 def print_performance_metrics(

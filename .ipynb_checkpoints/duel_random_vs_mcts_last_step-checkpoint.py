@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# duel_random_vs_random.py – random-vs-random using GoEnginePhysics + debug history
+# duel_random_vs_mcts.py – random-vs-MCTS using GameStateMachine + debug history
 
 from __future__ import annotations
 
@@ -7,7 +7,9 @@ import os
 import time
 import signal
 
-print(f"[PID {os.getpid()}] duel_random_physics start", flush=True)
+from pprint import pprint
+
+print(f"[PID {os.getpid()}] duel_random_vs_mcts start", flush=True)
 
 try:
     import faulthandler
@@ -21,6 +23,10 @@ import torch
 from engine.game_state import create_empty_game_state
 from engine.game_state_machine import GameStateMachine   # the REAL physics engine
 from agents.random_bot import RandomBot
+from agents.mcts_bot   import MCTSBot
+
+from utils.game_history import GameHistory
+
 
 from utils.shared import (
     select_device,
@@ -47,7 +53,7 @@ def simulate_batch_games_with_history(
     history_dir: str = "debug_games",
 ):
     device = select_device()
-    print("Hello World", f"Running {num_games} games on {board_size}×{board_size} ({device})")
+    print("Hello World, random_vs_mcts", f"Running {num_games} games on {board_size}×{board_size} ({device})")
 
     # ------------------------------------------------------------------
     # Intialize game state state = 0
@@ -64,17 +70,27 @@ def simulate_batch_games_with_history(
 
     print(
         f"intialized boards[0]:",
-        real_state_machine.boards[0].cpu().tolist(),
+        real_state_machine.boards[0].tolist(),
     )
 
-    # Two bots: later you can swap random_bot_2 → MCTSBot, etc.
-    random_bot_1 = RandomBot()   # conceptually "Player 0,1 / Black"
-    random_bot_2 = RandomBot()   # conceptually "Player 1,2 / White"
+    print(
+        f"intialized boards[0]:",
+        real_state_machine.boards[0].shape,
+    )
 
+    B_tracked = num_games  # or num_games_to_save if you want
 
+    game_history = GameHistory(
+        T_max=max_plies,
+        B_tracked=B_tracked,
+        H=board_size,
+        device=device,
+    )
 
-
-
+    # Two bots
+    bot_A = RandomBot()   # conceptually "Player 0 / Black"
+    # max_nodes means max_budget here to build MCTS tree
+    bot_B = MCTSBot(max_nodes=512, max_depth=256, num_simulations=10)
 
     # unify: num_games_to_save drives both tracking and JSON outputs
     num_games_to_save = min(num_games_to_save, num_games)
@@ -82,63 +98,101 @@ def simulate_batch_games_with_history(
     # history container for first G games
     move_history = init_move_history(num_games_to_save)
 
+    # t = 0 state
+    game_history.boards[:,0].copy_(real_state_machine.boards[:B_tracked])
+    game_history.to_play[:,0].copy_(real_state_machine.to_play[:B_tracked])
+    game_history.hashes[:,0].copy_(real_state_machine.zobrist_hash[:B_tracked, 0])
+
+    # game_history 
+
     t0 = time.time()
     ply = 0
 
-    #--------------real board Main Loop
+    LAST_PLY = max_plies - 1  # e.g. 299 if max_plies = 300
+    print("LAST_PLY", LAST_PLY)
 
     with torch.no_grad():
         while ply < max_plies:
 
             print(f"Ply {ply:4d}: started")
 
-
-            # --- snapshot BEFORE the move (for history, from REAL engine) ---
             boards_before, to_play_before, hash_before = snapshot_pre_move(
                 real_state_machine, num_games_to_save
             )
 
-            # --- 2) select moves (this calls real_state_machine.legal_moves()) ---
- 
-            if ply % 2 == 0:
-                moves = random_bot_1.select_moves(real_state_machine)  # (B,2) long
+            # --- choose which bot based on ply ---
+            if ply < max_plies-1:
+                # all earlier moves: pure random
+                moves = bot_A.select_moves(real_state_machine)
             else:
-                moves = random_bot_2.select_moves(real_state_machine)  # (B,2) long
+
+                # last move: use MCTS
+                # print("real_state_last ply_about_to_play")
+                # print("real_state_last ply_to_play", real_state_machine.to_play[0:])
+                moves = bot_B.select_moves(real_state_machine)
+
+            game_history.moves[:, ply].copy_(moves[:B_tracked])
 
 
-            # --- 3) apply moves to the REAL physics engine ---
+            # print(f"ply {ply} sample moves[0:]:", moves[0:].cpu().tolist())
+
             real_state_machine.state_transition(moves)
 
+            print("real_state.boards[0]", real_state.boards[3])
 
-            print(
-                f"ply {ply} sample boards for consistency[0]:",
-                real_state_machine.boards[0].cpu().tolist(),
-            )
+
+            
+            # record next state
+            game_history.boards[:, ply + 1].copy_(real_state_machine.boards[:B_tracked])
+            game_history.to_play[:, ply + 1].copy_(real_state_machine.to_play[:B_tracked])
+            game_history.hashes[:, ply + 1].copy_(real_state_machine.zobrist_hash[:B_tracked, 0])
+                
+
+            
+            # print("real_state_last ply_to_play", real_state_machine.to_play[0:])
+
+
+
+
+            # print(
+            #     f"ply {ply} sample boards for consistency[0]:",
+            #     real_state_machine.boards[0].cpu().tolist(),
+            # )
 
             # --- snapshot AFTER the move hash (REAL zobrist) ---
             hash_after = real_state_machine.zobrist_hash[:, 0].clone()  # (B,)
 
-            # --- 4) record history for first G games ---
-            record_move_history(
-                move_history=move_history,
-                ply=ply,
-                moves=moves,
-                boards_before=boards_before,
-                to_play_before=to_play_before,
-                hash_before=hash_before,
-                hash_after=hash_after,
-                num_games_to_save=num_games_to_save,
-            )
+
 
             print(f"Ply {ply:4d}: finised")
 
             ply += 1
+                       
+    num_plies = ply
+
+    scores = real_state_machine.compute_scores(komi=komi)       # (B,2)
+    finished_flags = real_state_machine.is_game_over()          # (B,)
+
+    game_history.finalize(
+        num_plies=num_plies,
+        finished=finished_flags[:B_tracked],
+        scores=scores[:B_tracked],
+    )
+
+    print("Sanity check for game_history")
+    pprint(game_history.boards[3].tolist(), width=80, compact=True)
 
 
+    xxx= game_history.scores[:,0] - game_history.scores[:,1]
+    pprint( xxx[0:16].tolist(), width=80, compact=True)
 
+    
+    # now game_history is your final instance
+    # you can later use game_history.boards, game_history.moves, game_history.T_actual, etc.
 
 
     elapsed = time.time() - t0
+    print(f"\nFinished in {elapsed:.2f}s ({ply} plies simulated)")
 
     # --- final scoring on the REAL boards ---
     scores = real_state_machine.compute_scores(komi=komi)       # (B,2) float
@@ -213,13 +267,12 @@ def simulate_batch_games_with_history(
 
 if __name__ == "__main__":
     simulate_batch_games_with_history(
-        num_games=2**4,
-        board_size=9,
-        max_plies=10,
+        num_games=2**6,
+        board_size=3,
+        max_plies=4,
         komi=0,
         log_interval=128,
         enable_timing=False,
         num_games_to_save=2**4,
         history_dir="debug_games",
     )
-
