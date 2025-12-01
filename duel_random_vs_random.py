@@ -54,13 +54,13 @@ def simulate_batch_games_with_history(
     # ------------------------------------------------------------------
 
     
-    real_state = create_empty_game_state(
+    real_state_0 = create_empty_game_state(
         batch_size=num_games,
         board_size=board_size,
         device=device,
     )
 
-    real_state_machine = GameStateMachine(real_state)
+    real_state_machine = GameStateMachine(real_state_0)
 
     print(
         f"intialized boards[0]:",

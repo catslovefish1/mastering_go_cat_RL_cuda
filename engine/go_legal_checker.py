@@ -7,8 +7,6 @@ batched Go rules engine (board-plane + CSR captures)
 Board
 -----
 - board: (B, H, W) int8 with values: Stone.EMPTY, Stone.BLACK, Stone.WHITE
-  # current encoding: EMPTY=-1, BLACK=0, WHITE=1
-  
 - Internally we work on a flattened grid: N2 = H * W
 
 CSR nomenclature
@@ -40,10 +38,44 @@ Returns:
 from __future__ import annotations
 from typing import Optional, Tuple, Dict
 
+from dataclasses import dataclass 
+
 import torch
 from torch import Tensor
-
 from utils.shared import timed_method
+
+
+@dataclass
+class RulesLegalInfo:
+    """
+    Result of a rules-only legality / topology pass for a batch of boards.
+
+    All tensors share the same lifetime: they are valid for exactly one
+    board position (the one you passed into compute_batch_legal_and_info).
+    """
+
+    # main output (before ko filtering)
+    legal_mask: Tensor                 # (B,H,W) bool
+
+    # core group topology
+    roots: Tensor                      # (B,N2) int32
+    root_libs: Tensor                  # (B,N2) int32
+
+    # legality helpers
+    can_capture_any: Tensor            # (B,N2) bool
+    captured_group_local_index: Tensor # (B,N2,4) int32
+
+    # CSR (global, batch-wide)
+    stone_global_index: Tensor                 # (K,)   int32
+    stone_global_pointer: Tensor               # (R+1,) int32
+    group_global_pointer_per_board: Tensor     # (B+1,) int32
+
+    # LUTs (fast ID→ID maps)
+    stone_local_index_from_cell: Tensor        # (B,N2) int32
+    stone_local_index_from_root: Tensor        # (B,N2) int32
+
+
+
 
 # ------------------------------------------------------------------
 # Stone + sentinel constants (CURRENT ENCODING)
@@ -92,11 +124,11 @@ class GoLegalChecker:
         self._csr_debug_id = 0
         self._csr_capacity_K = 0
         self._csr_capacity_R = 0
-        self._csr_sg: Optional[Tensor] = None      # stone_global_index
-        self._csr_sp: Optional[Tensor] = None      # stone_global_pointer
-        self._csr_slc: Optional[Tensor] = None     # stone_local_index_from_cell
-        self._csr_slr: Optional[Tensor] = None     # stone_local_index_from_root
-        self._csr_gptr: Optional[Tensor] = None    # group_global_pointer_per_board
+        # self._csr_sg: Optional[Tensor] = None      # stone_global_index
+        # self._csr_sp: Optional[Tensor] = None      # stone_global_pointer
+        # self._csr_slc: Optional[Tensor] = None     # stone_local_index_from_cell
+        # self._csr_slr: Optional[Tensor] = None     # stone_local_index_from_root
+        # self._csr_gptr: Optional[Tensor] = None    # group_global_pointer_per_board
 
         self._init_flat_board_structure()
 
@@ -313,35 +345,22 @@ class GoLegalChecker:
     @timed_method
     def _ensure_uf_workspace(self, B: int, N2: int, dev: torch.device) -> Tensor:
         """
-        Ensure we have a reusable (B,N2,4) int32 workspace for UF neighbour parents.
-        We treat the buffer as a *capacity* buffer:
-        - allocate once with at least (B,N2,4)
-        - reuse it forever
-        - if we ever need larger B or N2, grow it, but never shrink.
+        One-time allocation of (B, N2, 4) workspace.
+        Assumes B, N2, device stay constant for this checker.
         """
-        ws = self._uf_nbr_parent
+        if self._uf_nbr_parent is None:
+            self._uf_nbr_parent = torch.empty((B, N2, 4), dtype=torch.int32, device=dev)
+            return self._uf_nbr_parent
+    
+        # optional: very cheap sanity checks in debug phase
+        # assert self._uf_nbr_parent.shape[:2] == (B, N2)
+        # assert self._uf_nbr_parent.device == dev
+    
+        return self._uf_nbr_parent
 
-        required_shape = (B, N2, 4)
-
-        # If no buffer yet, or on a different device / dtype, create fresh
-        if ws is None or ws.device != dev or ws.dtype != torch.int32:
-            ws = torch.empty(required_shape, dtype=torch.int32, device=dev)
-            self._uf_nbr_parent = ws
-            return ws
-
-        # If existing buffer is too small in B or N2, grow capacity
-        cur_B, cur_N2, cur_4 = ws.shape
-        if cur_B < B or cur_N2 < N2 or cur_4 != 4:
-            new_B = max(cur_B, B)
-            new_N2 = max(cur_N2, N2)
-            ws = torch.empty((new_B, new_N2, 4), dtype=torch.int32, device=dev)
-            self._uf_nbr_parent = ws
-            return ws[:B, :N2]
-
-        # Otherwise, reuse existing buffer; just slice to requested view
-        return ws[:B, :N2]
 
     @timed_method
+    @torch.no_grad()
     def _hook_and_compress(
         self,
         parent: Tensor,              # (B,N2) int32
@@ -358,6 +377,14 @@ class GoLegalChecker:
 
         # Reusable (B,N2,4) int32 workspace (capacity-based, sliced)
         neighbor_parent_ws = self._ensure_uf_workspace(B, N2, dev)
+
+        # # Local workspace: (B,N2,4) int32
+        # neighbor_parent_ws = torch.empty(
+        #     (B, N2, 4),
+        #     dtype=torch.int32,
+        #     device=dev,
+        # )
+
 
         max_rounds = N2.bit_length() + 100
 
@@ -398,7 +425,6 @@ class GoLegalChecker:
     # ------------------------------------------------------------------
     # Territory (Chinese area scoring: empty regions -> black/white/neutral)
     # ------------------------------------------------------------------
-    @torch.no_grad()
     @timed_method
     def compute_territory(self, board: Tensor) -> Tensor:
         """
@@ -508,7 +534,6 @@ class GoLegalChecker:
     # ------------------------------------------------------------------
     # Build CSR + LUTs (global across batch; safe for K=0)
     # ------------------------------------------------------------------
-    @torch.no_grad()
     @timed_method
     def _build_group_csr(self, roots: Tensor):
         dev = self.device or self.board_flatten.device

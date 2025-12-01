@@ -6,8 +6,9 @@ from typing import Dict, Tuple
 import torch
 from torch import Tensor
 
-from .game_state import GameState
+
 from .stones import Stone
+from .game_state import GameState
 from .go_legal_checker import GoLegalChecker
 from utils.shared import timed_method
 
@@ -60,6 +61,7 @@ class GameStateMachine:
         self._init_zobrist_tables()
 
         # caches for reuse between legal_moves() and state_transition()
+        # Lifetime = “valid for the current board position, until we change state and call
         self._latest_legal_mask_raw: Tensor | None = None  # before ko-filter
         self._latest_legal_mask: Tensor | None = None      # after ko-filter
         self._latest_legal_info: Dict | None = None

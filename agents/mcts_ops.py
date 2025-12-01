@@ -44,8 +44,8 @@ def run_mcts_random_root(
     assert H == W == tree.board_size, "Tree and GameStateMachine board sizes must match"
 
     dev = game_state_machine.device
-    A = tree.A
-    root = tree.root_index
+    A = tree.A       
+    root = tree.root_node =0
     pass_idx = H * W
 
     # flatten legal board points

@@ -43,8 +43,17 @@ class RandomBot:
         moves = torch.full((B, 2), -1, dtype=torch.long, device=dev)
 
         # 3) find which games have at least one legal move
+        print("legal_mask", legal_mask.shape)
         flat_legal = legal_mask.view(B, -1)       # (B, H*W)
+        print("flat_legal", flat_legal.shape)
+        print(flat_legal.unique())
         has_legal = flat_legal.any(dim=1)         # (B,)
+
+        vals, counts = flat_legal.unique(return_counts=True)
+        print("vals:", vals)
+        print("counts:", counts)
+
+        
         if not has_legal.any():
             return moves  # everyone passes
 

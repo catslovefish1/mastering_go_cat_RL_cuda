@@ -72,6 +72,7 @@ def simulate_batch_games_with_history(
     # Two bots
     bot_A = RandomBot() 
     bot_B = MCTSBot(max_nodes=512, max_depth=256, num_simulations=10)
+    # bot_B = RandomBot() 
 
 
     # t = 0 state
@@ -85,12 +86,12 @@ def simulate_batch_games_with_history(
     ply = 0
 
     LAST_PLY = max_plies - 1  # e.g. 299 if max_plies = 300
-    print("LAST_PLY", LAST_PLY)
 
     with torch.no_grad():
         while ply < max_plies:
 
-            print(f"Ply {ply:4d}: started")
+            if ply % log_interval == 0:
+                print("current ply", ply )
 
 
             # --- choose which bot based on ply ---
@@ -113,6 +114,8 @@ def simulate_batch_games_with_history(
         
 
             ply += 1
+
+    elapsed = time.time() - t0
                        
 
     outcome_ratios= real_state_machine.outcome_ratios(komi=komi)
@@ -136,17 +139,34 @@ def simulate_batch_games_with_history(
         out_dir=history_dir,
         num_games_to_save=num_games_to_save,
     )
+
+
+    # --- timing ---
+    if enable_timing:
+        print_timing_report(real_state_machine)
+        print_timing_report(real_state_machine.legal_checker)
+        print_performance_metrics(elapsed, ply, num_games)
+
+    # --- GPU memory (CUDA only) ---
+    if device.type == "cuda":
+        MB = 1024 ** 2
+        peak_alloc = torch.cuda.max_memory_allocated(device) / MB
+        peak_res   = torch.cuda.max_memory_reserved(device) / MB
+        cur  = torch.cuda.memory_allocated(device) / MB
+        res  = torch.cuda.memory_reserved(device) / MB
+        print(f"[CUDA][FINAL] current={cur:.1f} MB reserved={res:.1f} MB")
+        print(f"[CUDA][FINAL] peak_alloc={peak_alloc:.1f} MB peak_reserved={peak_res:.1f} MB")
     
 
 
 if __name__ == "__main__":
     simulate_batch_games_with_history(
-        num_games=2**6,
+        num_games=2**2,
         num_games_to_save=2**2,  #to_json
-        board_size=9,
-        max_plies=100,
+        board_size=19,
+        max_plies=10,
         komi=0,
-        log_interval=128,
+        log_interval=1,
         enable_timing=True,
         history_dir="debug_games",
     )
