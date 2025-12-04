@@ -6,13 +6,13 @@ from torch import Tensor
 
 from engine.game_state_machine import GameStateMachine
 from engine.game_state import GameState
-from .mcts_tree import MCTSTreeIndexInfo
+from .mcts_tree import MCTSTree
 
 
 @torch.no_grad()
 def run_mcts_random_root(
-    tree: MCTSTreeIndexInfo,
-    game_state_machine: GameStateMachine,
+    tree: MCTSTree,
+    root_game_state_machine: GameStateMachine,  # immutable root physics
     num_simulations: int,   # ignored for now
     komi: float = 0.0,
     debug: bool = False,
@@ -20,11 +20,13 @@ def run_mcts_random_root(
     """
     Greedy root search using compute_scores on a GameStateMachine, fully batched:
 
-      - Build legal actions at root for all games.
+      - Use root_game_state_machine (physics on root_state) to:
+          * get legal moves at the root
+          * read root tensors (boards, to_play, pass_count, zobrist_hash)
       - Collect all legal (b,a) pairs into a single big batch of size K.
-      - Clone those K root states into a batched GameStateMachine.
+      - Clone those K root states into a batched eval_game_state_machine.
       - Apply all K moves in parallel.
-      - Call compute_scores() once on that batch.
+      - Call compute_scores() once on that eval batch.
       - Convert scores to values v in {-1,0,+1} from root player's POV.
       - Scatter back into values[b,a], and pick best action per game by argmax.
 
@@ -33,19 +35,16 @@ def run_mcts_random_root(
     actions : (B,) long
         0 .. H*W-1  => board points
         H*W         => pass
-    """ 
+    """
 
-
-
-    
-    # --- 1) legal mask at the root (on the VIRTUAL GameStateMachine) ---
-    legal_mask_2d = game_state_machine.legal_moves()  # (B, H, W) bool
+    # --- 1) legal mask at the root (on root_game_state_machine) ---
+    legal_mask_2d = root_game_state_machine.legal_moves()  # (B, H, W) bool
     B, H, W = legal_mask_2d.shape
     assert H == W == tree.board_size, "Tree and GameStateMachine board sizes must match"
 
-    dev = game_state_machine.device
-    A = tree.A       
-    root = tree.root_node =0
+    dev = root_game_state_machine.device
+    A = tree.A
+    root = 0
     pass_idx = H * W
 
     # flatten legal board points
@@ -55,8 +54,6 @@ def run_mcts_random_root(
     # build per-action legal mask at root
     root_legal = torch.zeros((B, A), dtype=torch.bool, device=dev)
     root_legal[:, : H * W] = flat_legal
-    # pass is legal only when there is no board move
-    root_legal[~has_legal, pass_idx] = True
 
     # After: pass is always allowed as a root action
     root_legal[:, pass_idx] = True
@@ -77,14 +74,15 @@ def run_mcts_random_root(
             print("[MCTS_ROOT][debug] no legal actions at all, forced pass for all games")
         return actions
 
-    # --- 3) build batched root states for those K pairs ---
-    boards_eval       = game_state_machine.boards[b_idx].clone()        # (K, H, W)
-    to_play_eval      = game_state_machine.to_play[b_idx].clone()       # (K,)
-    print("[MCTS_ROOT][debug] to_play_eval_is_about_to_print")
-    print("[MCTS_ROOT][debug] to_play_eval (first 32):",
-          to_play_eval[0:3].cpu().tolist())
-    pass_count_eval   = game_state_machine.pass_count[b_idx].clone()    # (K,)
-    zobrist_hash_eval = game_state_machine.zobrist_hash[b_idx].clone()  # (K, 2)
+    # --- 3) build batched root successor states for those K pairs ---
+    # NOTE: root_game_state_machine is read-only; we clone from its tensors.
+    boards_eval       = root_game_state_machine.boards[b_idx].clone()        # (K, H, W)
+    to_play_eval      = root_game_state_machine.to_play[b_idx].clone()       # (K,)
+    if debug:
+        print("[MCTS_ROOT][debug] to_play_eval (first 3):",
+              to_play_eval[0:3].cpu().tolist())
+    pass_count_eval   = root_game_state_machine.pass_count[b_idx].clone()    # (K,)
+    zobrist_hash_eval = root_game_state_machine.zobrist_hash[b_idx].clone()  # (K, 2)
 
     state_eval = GameState(
         boards=boards_eval,
@@ -92,7 +90,7 @@ def run_mcts_random_root(
         pass_count=pass_count_eval,
         zobrist_hash=zobrist_hash_eval,
     )
-    game_state_machine_eval = GameStateMachine(state_eval)
+    eval_game_state_machine = GameStateMachine(state_eval)
 
     # --- 4) build moves for each (b,a) ---
     rows = a_idx // H
@@ -103,38 +101,24 @@ def run_mcts_random_root(
     is_pass = (a_idx == pass_idx)
     moves_eval[is_pass] = -1
 
-    # apply all moves in parallel
-    game_state_machine_eval.state_transition(moves_eval)
-
-    
+    # apply all moves in parallel (on eval_game_state_machine only)
+    eval_game_state_machine.state_transition(moves_eval)
 
     # --- 5) score all K successor states in parallel ---
-    # scores_eval = game_state_machine_eval.compute_scores(komi=komi)  # (K,2) float
+    scores_eval = eval_game_state_machine.compute_scores(komi=komi)  # (K,2) float
 
-    # # values from root player's perspective
-    # root_players = to_play_eval.to(torch.long)  # (K,) 0=black,1=white
-
-    # # <<< DEBUG PRINT HERE >>>
-    # print("[MCTS_ROOT][debug] root_player_is_about_to_print")
-    # print("[MCTS_ROOT][debug] root_players (first 32):",
-    #       root_players[:].cpu().tolist())
-
-    scores_eval = game_state_machine_eval.compute_scores(komi=komi)  # (K,2) float
     # values from ROOT player's perspective
-    # Use the engine's current .to_play and index by b_idx → cannot drift.
-    root_to_play_full = game_state_machine.to_play.to(torch.long)  # (B,)
-    root_players = root_to_play_full[b_idx]                        # (K,) 0=black,1=white
+    root_to_play_full = root_game_state_machine.to_play.to(torch.long)  # (B,)
+    root_players = root_to_play_full[b_idx]                             # (K,) 0=black,1=white
     other = 1 - root_players
-    
+
     if debug:
-        print("[MCTS_ROOT][debug] engine.to_play unique:",
-              torch.unique(game_state_machine.to_play).cpu().tolist())
+        print("[MCTS_ROOT][debug] root_engine.to_play unique:",
+              torch.unique(root_game_state_machine.to_play).cpu().tolist())
         print("[MCTS_ROOT][debug] root_players unique:",
               torch.unique(root_players).cpu().tolist())
         print("[MCTS_ROOT][debug] root_players (first 32):",
               root_players[:32].cpu().tolist())
-
-    other = 1 - root_players
 
     arange_K = torch.arange(K, device=dev)
     s_root  = scores_eval[arange_K, root_players]  # (K,)
@@ -168,64 +152,5 @@ def run_mcts_random_root(
 
     # optional: store "visit count" = #evaluated actions
     tree.N[:, root] = (values > -1e8).sum(dim=1).to(torch.float32)
-
-    # --- 8) debug block: global and per-game winning stats ---
-    if debug:
-        win_mask  = (values ==  1.0) & root_legal   # only legal + winning
-        draw_mask = (values ==  0.0) & root_legal
-        loss_mask = (values == -1.0) & root_legal
-
-        total_wins  = int(win_mask.sum().item())
-        total_draws = int(draw_mask.sum().item())
-        total_loss  = int(loss_mask.sum().item())
-
-        print(
-            f"[MCTS_ROOT][debug] B={B}, H={H}, W={W}, A={A}, K={K}",
-            flush=True,
-        )
-        print(
-            f"[MCTS_ROOT][debug] winning successors (global): "
-            f"{total_wins}, draw: {total_draws}, loss: {total_loss}",
-            flush=True,
-        )
-
-        # Per-game stats: how many winning actions per b
-        win_counts_per_b = win_mask.sum(dim=1)  # (B,)
-        num_with_win = int((win_counts_per_b > 0).sum().item())
-        num_no_win   = B - num_with_win
-
-        print(
-            f"[MCTS_ROOT][debug] games with ≥1 winning action: {num_with_win} / {B}",
-            flush=True,
-        )
-        print(
-            f"[MCTS_ROOT][debug] games with 0 winning actions: {num_no_win}",
-            flush=True,
-        )
-
-        # For *every* game with ≥1 winning action, show ONE example (to keep logs small)
-        for b in range(B):
-            wc = int(win_counts_per_b[b].item())
-            if wc == 0:
-                continue
-
-            win_actions_b = win_mask[b].nonzero(as_tuple=True)[0]  # (k_b,)
-            a0 = int(win_actions_b[0].item())
-
-            if a0 == pass_idx:
-                r_str, c_str = "-1", "-1"
-            else:
-                r0 = a0 // H
-                c0 = a0 % H
-                r_str, c_str = str(int(r0)), str(int(c0))
-
-            print(
-                f"[MCTS_ROOT][debug] game b={b}, {wc} winning actions (show 1):",
-                flush=True,
-            )
-            print(
-                f"  a={a0:3d} (r={r_str}, c={c_str}) winning",
-                flush=True,
-            )
 
     return actions

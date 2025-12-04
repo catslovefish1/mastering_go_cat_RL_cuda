@@ -7,7 +7,7 @@ from torch import Tensor
 
 from engine.game_state_machine import GameStateMachine
 from engine.game_state import GameState
-from .mcts_tree import MCTSTreeIndexInfo, build_mcts_tree_from_engine_data
+from .mcts_tree import MCTSTree
 from .mcts_ops import run_mcts_random_root
 
 
@@ -35,64 +35,28 @@ class MCTSBot:
           5. Convert actions -> (row, col) moves and return.
         """
         # 1) clone rich state
-        search_state = clone_batch_state_from_engine(real_game_state_machine)  # GameState
-        
-        search_game_state_machine = GameStateMachine(search_state)            # virtual search physics
 
-        print("search_state_last ply_about_to_play")
-        print("search_state_last ply_to_play", search_game_state_machine.to_play[0:])
+        root_state = real_game_state_machine.state.clone()
+        root_game_state_machine = GameStateMachine(root_state)
         
         # 2) build bundled tree from the *search* GameStateMachine
-        tree: MCTSTreeIndexInfo = build_mcts_tree_from_engine_data(
-            engine=search_game_state_machine,
-            max_nodes=self.max_nodes,
-            max_depth=self.max_depth,
-        )
-        print("mcts_tree.to_play")
-        print(tree.to_play[0:])
-        print("mcts_tree.parent")
-        print(tree.parent[0:])
-        print("move_pos_from_parent")
-        print(tree.move_pos_from_parent)
-        print("move_pos_from_parent")
+        tree = MCTSTree.from_state(root_state, max_nodes=self.max_nodes, max_depth=self.max_depth)
+
         
 
         # 3) run trivial "MCTS" at root (random policy for now)
         actions = run_mcts_random_root(
             tree=tree,
-            game_state_machine=search_game_state_machine,
+            root_game_state_machine=root_game_state_machine,
             num_simulations=self.num_simulations,
-            debug=False,  # set True only for tiny batches
-        )  # (B,)
+            debug=False,
+        )
+        print(actions.shape)
+        print(actions[:10])
 
         # 4) convert actions -> (row, col) moves
         moves = actions_to_rc(actions, board_size=tree.board_size)  # (B,2)
         return moves
-
-
-# ---------------------------------------------------------------------
-# Helper: clone rich state from REAL GameStateMachine
-# ---------------------------------------------------------------------
-
-
-def clone_batch_state_from_engine(real_game_state_machine: GameStateMachine) -> GameState:
-    """
-    Clone the FULL batch state from the REAL GameStateMachine so that
-    search can mutate it freely without touching the real game.
-
-    Returns a fresh GameState on the same device.
-    """
-    return GameState(
-        boards=real_game_state_machine.boards.clone(),
-        to_play=real_game_state_machine.to_play.clone(),
-        pass_count=real_game_state_machine.pass_count.clone(),
-        zobrist_hash=real_game_state_machine.zobrist_hash.clone(),
-    )
-
-    # --- sanity: clone must match real exactly at root ---
-    assert torch.equal(
-        clone.to_play, real_engine.to_play
-    ), "[clone_batch_state_from_engine] to_play mismatch between real and clone"
 
 
 

@@ -161,10 +161,10 @@ def simulate_batch_games_with_history(
 
 if __name__ == "__main__":
     simulate_batch_games_with_history(
-        num_games=2**2,
+        num_games=2**10,
         num_games_to_save=2**2,  #to_json
         board_size=19,
-        max_plies=10,
+        max_plies=300,
         komi=0,
         log_interval=1,
         enable_timing=True,

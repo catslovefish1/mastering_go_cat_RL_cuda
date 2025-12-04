@@ -19,6 +19,8 @@ class GameState:
     pass_count: Tensor    # (B,) int8 (0,1,2)
     zobrist_hash: Tensor  # (B, 2) int32: [:,0]=current, [:,1]=previous
 
+    # -------- convenience properties --------
+
     @property
     def device(self) -> torch.device:
         return self.boards.device
@@ -30,6 +32,20 @@ class GameState:
     @property
     def board_size(self) -> int:
         return int(self.boards.shape[-1])
+
+    # -------- cloning --------
+
+    def clone(self) -> GameState:
+        """
+        Deep-ish copy: new GameState object with cloned tensors
+        (same values, same device, independent storage).
+        """
+        return GameState(
+            boards=self.boards.clone(),
+            to_play=self.to_play.clone(),
+            pass_count=self.pass_count.clone(),
+            zobrist_hash=self.zobrist_hash.clone(),
+        )
 
 
 def create_empty_game_state(
@@ -46,7 +62,7 @@ def create_empty_game_state(
         dtype=torch.int8,
         device=device,
     )
-    to_play = torch.zeros(B, dtype=torch.int8, device=device)       # BLACK
+    to_play = torch.zeros(B, dtype=torch.int8, device=device)       # BLACK to move
     pass_count = torch.zeros(B, dtype=torch.int8, device=device)
     zobrist_hash = torch.zeros(B, 2, dtype=torch.int32, device=device)
 
