@@ -71,7 +71,7 @@ def simulate_batch_games_with_history(
 
     # Two bots
     bot_A = RandomBot() 
-    bot_B = MCTSBot(max_nodes=512, max_depth=256, num_simulations=10)
+    bot_B = MCTSBot(max_nodes=30, max_depth=256)
     # bot_B = RandomBot() 
 
 
@@ -85,7 +85,6 @@ def simulate_batch_games_with_history(
     t0 = time.time()
     ply = 0
 
-    LAST_PLY = max_plies - 1  # e.g. 299 if max_plies = 300
 
     with torch.no_grad():
         while ply < max_plies:
@@ -94,14 +93,23 @@ def simulate_batch_games_with_history(
                 print("current ply", ply )
 
 
-            # --- choose which bot based on ply ---
-            if ply < max_plies-1:
-                # all earlier moves: pure random
-                moves = bot_A.select_moves(real_state_machine)
-            else:
-                moves = bot_B.select_moves(real_state_machine)
-
+            # # --- choose which bot based on ply ---
+            # # --- choose which bot based on ply ---
+            # if ply < max_plies - max_plies:
+            #     # all earlier moves: pure random
+            #     moves = bot_A.select_moves(real_state_machine)
+            # else:
+                if ply % 2 == 0:
+                    over = real_state_machine.is_game_over()
+                    print("alive games before MCTS:", (~over).sum().item())
+                    # even plies near the end: still random
+                    moves = bot_A.select_moves(real_state_machine)
+                else:
+                    # odd plies near the end: use MCTS
+                    moves = bot_B.select_moves(real_state_machine)
+            
             game_history.moves[:, ply].copy_(moves[:B_tracked])
+
 
 
             real_state_machine.state_transition(moves)
@@ -161,10 +169,10 @@ def simulate_batch_games_with_history(
 
 if __name__ == "__main__":
     simulate_batch_games_with_history(
-        num_games=2**10,
+        num_games=2**4,
         num_games_to_save=2**2,  #to_json
-        board_size=19,
-        max_plies=300,
+        board_size=5,
+        max_plies=50,
         komi=0,
         log_interval=1,
         enable_timing=True,

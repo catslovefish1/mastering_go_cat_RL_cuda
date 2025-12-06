@@ -192,13 +192,14 @@ class MCTSTree:
         state: "GameState",
         max_nodes: int,
         max_depth: int,
-    ) -> "MCTSTreeIndexInfo":
+    ) -> "MCTSTree":
         """
         Build a tree from a root GameState snapshot.
 
         This is the natural entry point for MCTS:
-          root_state = real_engine.state.clone()
-          tree = MCTSTreeIndexInfo.from_state(root_state, max_nodes, max_depth)
+
+            root_state = real_engine.state.clone()
+            tree = MCTSTree.from_state(root_state, max_nodes, max_depth)
         """
         return cls(
             batch_size=state.batch_size,

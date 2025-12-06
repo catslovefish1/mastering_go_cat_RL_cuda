@@ -1,24 +1,29 @@
 # agents/random_bot.py
 
 from __future__ import annotations
-from typing import Optional  # you can actually delete this now
 
 import torch
 from torch import Tensor
 
 from engine.game_state_machine import GameStateMachine
+from .mcts_ops import actions_to_moves  # reuse the shared helper
 
 
 class RandomBot:
     """
-    Go bot that works directly with GameStateMachine:
-    - Asks engine.legal_moves() for a (B, H, W) legal mask.
-    - Samples one legal move uniformly per game.
-    - Returns [-1, -1] when no legal moves (pass).
+    Simple random Go bot:
+
+    - Asks engine.legal_moves() for a (B, H, W) mask of legal board points.
+    - Extends that to an action space of size A = H*H + 1 by treating
+      the last index as "pass", which is always legal.
+    - Samples one action uniformly over all legal actions (including pass).
+    - Converts the sampled action indices to (row, col) moves:
+        * 0 .. H*H-1 -> board points
+        * H*H        -> pass -> (-1, -1)
     """
 
     def __init__(self) -> None:
-        # No device stored; always use engine.device
+        # No device stored; we always take it from the engine
         pass
 
     @torch.no_grad()
@@ -26,52 +31,37 @@ class RandomBot:
         """
         Args
         ----
-        engine : GameStateMachine
-            The engine holding the current batched state.
+        game_state_machine : GameStateMachine
+            Engine holding the current batched state.
 
         Returns
         -------
-        moves : (B,2) long
-            (row, col) per game; (-1, -1) for pass.
+        moves : (B, 2) long
+            (row, col) per game; (-1, -1) encodes pass.
         """
-        # 1) get legal mask from engine; also primes internal caches
-        legal_mask = game_state_machine.legal_moves()   # (B,H,W) bool
-        B, H, W = legal_mask.shape
-        dev = game_state_machine.device                 # inherit device from state / engine
+        # 1) Legal board points
+        legal_mask_2d = game_state_machine.legal_moves()  # (B, H, W) bool
+        B, H, W = legal_mask_2d.shape
+        dev = game_state_machine.device
 
-        # 2) start with all passes
-        moves = torch.full((B, 2), -1, dtype=torch.long, device=dev)
+        # 2) Build extended legal mask over actions: A = H*H + 1
+        A = H * H + 1
+        pass_idx = A - 1
 
-        # 3) find which games have at least one legal move
-        print("legal_mask", legal_mask.shape)
-        flat_legal = legal_mask.view(B, -1)       # (B, H*W)
-        print("flat_legal", flat_legal.shape)
-        print(flat_legal.unique())
-        has_legal = flat_legal.any(dim=1)         # (B,)
+        flat_board = legal_mask_2d.view(B, H * H)              # (B, H*H)
+        legal_actions = torch.zeros(B, A, dtype=torch.bool, device=dev)
+        legal_actions[:, : H * H] = flat_board
+        legal_actions[:, pass_idx] = True                      # pass always legal
 
-        vals, counts = flat_legal.unique(return_counts=True)
-        print("vals:", vals)
-        print("counts:", counts)
+        # 3) Turn legal mask into uniform probabilities over legal actions
+        probs = legal_actions.float()                          # (B, A)
+        row_sums = probs.sum(dim=1, keepdim=True)              # (B, 1)
+        # Defensive clamp; in practice row_sums >= 1 because pass is legal
+        probs = probs / row_sums.clamp(min=1.0)
 
-        
-        if not has_legal.any():
-            return moves  # everyone passes
+        # 4) Sample one action index per game
+        actions = torch.multinomial(probs, num_samples=1).squeeze(1)  # (B,)
 
-        playable_idx = has_legal.nonzero(as_tuple=True)[0]  # (B_play,)
-        playable_legal = flat_legal[playable_idx]           # (B_play, H*W)
-
-        # 4) uniform distribution over legal points
-        probs = playable_legal.float()
-        row_sums = probs.sum(dim=1, keepdim=True)           # (B_play, 1)
-        probs = probs / row_sums.clamp(min=1.0)             # defensive
-
-        # 5) sample one legal flat index per playable game
-        flat_indices = torch.multinomial(probs, num_samples=1).squeeze(1)  # (B_play,)
-        rows = flat_indices // W
-        cols = flat_indices % W
-
-        # 6) write them back into the (B,2) moves tensor
-        moves[playable_idx] = torch.stack([rows, cols], dim=1)
+        # 5) Convert action indices -> (row, col) moves (handles pass)
+        moves = actions_to_moves(actions, board_size=H)  # (B, 2)
         return moves
-
-
