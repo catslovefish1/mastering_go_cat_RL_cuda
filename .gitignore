@@ -1,0 +1,9 @@
+# Jupyter auto-generated checkpoints
+.ipynb_checkpoints/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
