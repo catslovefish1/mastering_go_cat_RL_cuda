@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 class MCTSTree:
     """
-    Bundled MCTS tree state for a batched Go position.
+    Bundled MCTS tree state for a batched Go state.
 
     Design (local tree per game)
     ----------------------------
@@ -88,14 +88,6 @@ class MCTSTree:
             dtype=torch.int16,
             device=self.device,
         )  # (B, M)
-
-        # (row, col) from parent -> this node, (-1,-1) = root/pass
-        self.move_pos_from_parent: Tensor = torch.full(
-            (self.B, self.M, 2),
-            -1,
-            dtype=torch.int8,
-            device=self.device,
-        )  # (B, M, 2)
 
         # Flags
         self.is_expanded: Tensor = torch.zeros(
@@ -175,7 +167,6 @@ class MCTSTree:
         self.parent[:, root_n] = -1
         self.parent_action[:, root_n] = -1
         self.depth[:, root_n] = 0
-        self.move_pos_from_parent[:, root_n, :] = -1
         self.is_expanded[:, root_n] = False
         self.is_terminal[:, root_n] = False
 
@@ -216,7 +207,7 @@ class MCTSTree:
         engine: "GameStateMachine",
         max_nodes: int,
         max_depth: int,
-    ) -> "MCTSTreeIndexInfo":
+    ) -> "MCTSTree":
         """
         Convenience: build from a GameStateMachine by using its internal state.
         """

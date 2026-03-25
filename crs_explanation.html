@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CSR in the Go Engine</title>
+<link href="https://fonts.googleapis.com/css2?family=Bitter:wght@400;600;700&family=Source+Code+Pro:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0a0e14;
+  --surface:#111820;
+  --surface2:#171e28;
+  --border:#1e2a3a;
+  --border-bright:#2a3a50;
+  --text:#c8d4e0;
+  --dim:#6a7a8e;
+  --heading:#e8eef4;
+
+  --csr-stones:#e8a44a;
+  --csr-ptr:#5eaaf5;
+  --csr-offset:#b07ee8;
+  --csr-lut:#4ec990;
+
+  --local:#e8a44a;
+  --global:#5eaaf5;
+  --point:#4ec990;
+  --board:#e07070;
+
+  --code-bg:#0d1219;
+  --hover:#141c26;
+}
+body{background:var(--bg);color:var(--text);font-family:'Bitter',Georgia,serif;line-height:1.7;padding:2.5rem 2rem;max-width:1140px;margin:0 auto}
+code,pre,.mono{font-family:'Source Code Pro',monospace}
+h1{font-size:2.2rem;font-weight:700;color:var(--heading);letter-spacing:-.03em;margin-bottom:.2rem}
+.subtitle{color:var(--dim);font-size:.95rem;margin-bottom:2.8rem;font-style:italic}
+h2{font-size:1.3rem;font-weight:700;color:var(--heading);margin-bottom:1rem;padding-bottom:.6rem;border-bottom:1px solid var(--border)}
+h3{font-size:1.05rem;font-weight:600;color:var(--heading);margin:1.5rem 0 .8rem}
+section{margin-bottom:3rem}
+p{margin-bottom:.8rem}
+a{color:var(--csr-ptr);text-decoration:none}
+a:hover{text-decoration:underline}
+
+.intro-grid{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;margin-bottom:1.5rem}
+@media(max-width:700px){.intro-grid{grid-template-columns:1fr}}
+.intro-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1.3rem 1.4rem}
+.intro-card h3{margin:0 0 .5rem;font-size:1rem}
+.intro-card p{margin:0;font-size:.88rem;color:var(--dim);line-height:1.6}
+
+.csr-demo{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1.5rem;margin:1.2rem 0;overflow-x:auto}
+.csr-demo .label{font-family:'Source Code Pro',monospace;font-weight:600;font-size:.82rem;margin-bottom:.4rem;display:flex;align-items:center;gap:.5rem}
+.csr-demo .label .dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.arr{display:flex;gap:0;margin-bottom:.6rem;flex-wrap:wrap}
+.arr .cell{min-width:36px;height:36px;display:flex;align-items:center;justify-content:center;font-family:'Source Code Pro',monospace;font-size:.78rem;font-weight:600;border:1px solid var(--border);background:var(--surface2)}
+.arr .cell:first-child{border-radius:6px 0 0 6px}
+.arr .cell:last-child{border-radius:0 6px 6px 0}
+.arr .cell.hl-stones{background:rgba(232,164,74,.12);color:var(--csr-stones);border-color:rgba(232,164,74,.3)}
+.arr .cell.hl-ptr{background:rgba(94,170,245,.12);color:var(--csr-ptr);border-color:rgba(94,170,245,.3)}
+.arr .cell.hl-offset{background:rgba(176,126,232,.12);color:var(--csr-offset);border-color:rgba(176,126,232,.3)}
+.arr .cell.hl-lut{background:rgba(78,201,144,.12);color:var(--csr-lut);border-color:rgba(78,201,144,.3)}
+.arr .cell.dim-cell{color:var(--dim);background:var(--surface)}
+.arr .cell.sep{border-left:2px solid var(--border-bright)}
+
+.mapping-table{width:100%;border-collapse:collapse;font-size:.85rem;margin:1rem 0}
+.mapping-table th{text-align:left;padding:.6rem .8rem;border-bottom:2px solid var(--border);color:var(--dim);font-weight:600;font-size:.76rem;text-transform:uppercase;letter-spacing:.04em;font-family:'Source Code Pro',monospace}
+.mapping-table td{padding:.55rem .8rem;border-bottom:1px solid var(--border);vertical-align:top}
+.mapping-table tr:hover td{background:var(--hover)}
+.mapping-table code{background:var(--code-bg);padding:.12rem .4rem;border-radius:4px;font-size:.8rem}
+
+.c-stones{color:var(--csr-stones)}
+.c-ptr{color:var(--csr-ptr)}
+.c-offset{color:var(--csr-offset)}
+.c-lut{color:var(--csr-lut)}
+.c-local{color:var(--local)}
+.c-global{color:var(--global)}
+.c-point{color:var(--point)}
+.c-board{color:var(--board)}
+.c-dim{color:var(--dim)}
+
+.pipeline{display:flex;flex-direction:column;gap:0;margin:1.2rem 0}
+.pipe-row{display:flex;align-items:stretch;min-height:72px}
+.pipe-label{width:200px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-family:'Source Code Pro',monospace;font-weight:600;font-size:.82rem;border:1px solid var(--border);padding:.5rem .8rem;text-align:center}
+.pipe-content{flex:1;border:1px solid var(--border);border-left:none;padding:.8rem 1.2rem;display:flex;flex-direction:column;justify-content:center;font-size:.85rem;line-height:1.7}
+.pipe-row:first-child .pipe-label,.pipe-row:first-child .pipe-content{border-radius:10px 10px 0 0}
+.pipe-row:last-child .pipe-label,.pipe-row:last-child .pipe-content{border-radius:0 0 10px 10px}
+.pipe-row.l1 .pipe-label{background:rgba(78,201,144,.08);color:var(--csr-lut)}
+.pipe-row.l2 .pipe-label{background:rgba(232,164,74,.08);color:var(--csr-stones)}
+.pipe-row.l3 .pipe-label{background:rgba(94,170,245,.08);color:var(--csr-ptr)}
+.pipe-row.l4 .pipe-label{background:rgba(176,126,232,.08);color:var(--csr-offset)}
+.pipe-content code{background:var(--code-bg);padding:.1rem .35rem;border-radius:4px;font-size:.78rem}
+
+.code-block{background:var(--code-bg);border:1px solid var(--border);border-radius:10px;padding:1.2rem 1.4rem;font-family:'Source Code Pro',monospace;font-size:.8rem;line-height:1.8;overflow-x:auto;white-space:pre;margin:1rem 0}
+.code-block .kw{color:var(--csr-ptr);font-weight:600}
+.code-block .cm{color:var(--dim);font-style:italic}
+.code-block .fn{color:var(--csr-lut)}
+.code-block .ty{color:var(--csr-offset)}
+.code-block .st{color:var(--csr-stones)}
+
+.flow-diagram{display:flex;align-items:center;gap:.4rem;flex-wrap:wrap;margin:1rem 0;font-family:'Source Code Pro',monospace;font-size:.82rem;font-weight:600}
+.flow-box{padding:.4rem .8rem;border-radius:8px;border:1px solid var(--border)}
+.flow-arrow{color:var(--dim);font-size:1.1rem}
+.flow-box.fb-point{background:rgba(78,201,144,.1);color:var(--point);border-color:rgba(78,201,144,.3)}
+.flow-box.fb-local{background:rgba(232,164,74,.1);color:var(--local);border-color:rgba(232,164,74,.3)}
+.flow-box.fb-global{background:rgba(94,170,245,.1);color:var(--global);border-color:rgba(94,170,245,.3)}
+.flow-box.fb-csr{background:rgba(176,126,232,.1);color:var(--csr-offset);border-color:rgba(176,126,232,.3)}
+
+.tag{display:inline-block;padding:.08rem .45rem;border-radius:5px;font-size:.72rem;font-weight:600;font-family:'Source Code Pro',monospace;margin-right:.2rem}
+.tag-local{background:rgba(232,164,74,.15);color:var(--local)}
+.tag-global{background:rgba(94,170,245,.15);color:var(--global)}
+.tag-point{background:rgba(78,201,144,.15);color:var(--point)}
+
+.interactive-wrap{display:flex;gap:1.5rem;align-items:flex-start;flex-wrap:wrap;margin:1.2rem 0}
+.interactive-wrap>div{flex:1;min-width:280px}
+.board-panel{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1.3rem}
+.board-panel .board-title{text-align:center;font-family:'Source Code Pro',monospace;font-weight:700;font-size:.85rem;margin-bottom:.8rem}
+.info-panel{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1.3rem;font-family:'Source Code Pro',monospace;font-size:.82rem;line-height:1.8;white-space:pre}
+
+.footer{text-align:center;color:var(--dim);font-size:.78rem;margin-top:2.5rem;padding-top:1.5rem;border-top:1px solid var(--border)}
+</style>
+</head>
+<body>
+
+<h1>CSR in the Go Engine</h1>
+<div class="subtitle">Compressed Sparse Row format for batched group topology &mdash; aligned with board_rules_checker.py</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<section>
+<h2>1. What is CSR?</h2>
+
+<div class="intro-grid">
+  <div class="intro-card">
+    <h3>The Problem</h3>
+    <p>A Go board has <strong>groups</strong> &mdash; connected sets of same-colour stones. Each group can have a different number of stones. We need to store all groups across a whole batch of boards in one flat structure that the GPU can process in parallel.</p>
+  </div>
+  <div class="intro-card">
+    <h3>The Solution: CSR</h3>
+    <p><strong>Compressed Sparse Row</strong> packs variable-length groups into two arrays: a flat <em>data</em> array of stone point ids, and a <em>pointer</em> array that says where each group starts and ends. No padding, no wasted memory.</p>
+  </div>
+</div>
+
+<h3>CSR in one picture</h3>
+<p>Suppose we have 3 groups across a batch. Group 0 has stones at points [2, 7], group 1 at [5, 10, 11], group 2 at [0].</p>
+
+<div class="csr-demo">
+  <div class="label"><div class="dot" style="background:var(--csr-stones)"></div><span class="c-stones">stone_point_ids</span> <span class="c-dim">&mdash; (K,) all stone coordinates, packed group by group</span></div>
+  <div class="arr">
+    <div class="cell hl-stones">2</div>
+    <div class="cell hl-stones">7</div>
+    <div class="cell hl-stones sep">5</div>
+    <div class="cell hl-stones">10</div>
+    <div class="cell hl-stones">11</div>
+    <div class="cell hl-stones sep">0</div>
+  </div>
+
+  <div class="label" style="margin-top:1rem"><div class="dot" style="background:var(--csr-ptr)"></div><span class="c-ptr">stone_pointer_by_group</span> <span class="c-dim">&mdash; (R+1,) where each group's slice starts/ends</span></div>
+  <div class="arr">
+    <div class="cell hl-ptr">0</div>
+    <div class="cell hl-ptr">2</div>
+    <div class="cell hl-ptr">5</div>
+    <div class="cell hl-ptr">6</div>
+  </div>
+  <div style="font-size:.78rem;color:var(--dim);margin-top:.3rem;font-family:'Source Code Pro',monospace">
+    group 0 → stone_point_ids[<span class="c-ptr">0</span>:<span class="c-ptr">2</span>] = [2, 7]
+    group 1 → stone_point_ids[<span class="c-ptr">2</span>:<span class="c-ptr">5</span>] = [5, 10, 11]
+    group 2 → stone_point_ids[<span class="c-ptr">5</span>:<span class="c-ptr">6</span>] = [0]
+  </div>
+</div>
+
+<p>This is the standard CSR (Compressed Sparse Row) pattern from sparse matrix libraries, repurposed here for <em>stone groups</em>. The pointer array has length R+1 (one more than the number of groups), so that <code>pointer[g+1] - pointer[g]</code> gives the size of group <code>g</code>.</p>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<section>
+<h2>2. The Two-Layer ID Mapping</h2>
+
+<p>The engine manages groups at two scales simultaneously. This is the core design insight &mdash; and the part that can be confusing at first.</p>
+
+<div class="intro-grid">
+  <div class="intro-card" style="border-color:rgba(232,164,74,.3)">
+    <h3 class="c-local">Layer 1: Board-Local Group IDs</h3>
+    <p>Each board in the batch has its own 0-based group numbering. Board 0 might have groups {0, 1, 2}, board 1 might have groups {0, 1}. These are compact and independent per board.</p>
+  </div>
+  <div class="intro-card" style="border-color:rgba(94,170,245,.3)">
+    <h3 class="c-global">Layer 2: Batch-Global Group IDs</h3>
+    <p>Across the whole batch, every group gets a unique ID by adding a per-board offset. Board 0's groups stay at {0, 1, 2}, but board 1's groups become {3, 4}. These global IDs index directly into the CSR pointer array.</p>
+  </div>
+</div>
+
+<h3>The conversion flow</h3>
+<div class="flow-diagram">
+  <div class="flow-box fb-point">root point</div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-box fb-local">local group id</div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-box fb-global">global group id</div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-box fb-csr">CSR stone range</div>
+</div>
+
+<div class="pipeline">
+  <div class="pipe-row l1">
+    <div class="pipe-label">root point<br>→ local id</div>
+    <div class="pipe-content">
+      <div><code>group_local_id_by_root_point[b, root]</code> → <span class="tag tag-local">local group id</span></div>
+      <div class="c-dim" style="font-size:.8rem;margin-top:.3rem">Union-find root point on board <em>b</em> maps to a 0-based local group id. Stored as <code>(B, N2)</code> LUT; -1 means "no group here".</div>
+    </div>
+  </div>
+  <div class="pipe-row l4">
+    <div class="pipe-label">local id<br>→ global id</div>
+    <div class="pipe-content">
+      <div><span class="tag tag-local">local</span> + <code>group_offset_by_board[b]</code> = <span class="tag tag-global">global group id</span></div>
+      <div class="c-dim" style="font-size:.8rem;margin-top:.3rem"><code>group_offset_by_board</code> is <code>(B+1,)</code> cumulative sum of groups-per-board. Board <em>b</em>'s local id 0 maps to global id <code>offset[b]</code>.</div>
+    </div>
+  </div>
+  <div class="pipe-row l3">
+    <div class="pipe-label">global id<br>→ stone range</div>
+    <div class="pipe-content">
+      <div><code>stone_point_ids[ stone_pointer_by_group[<span class="c-global">g</span>] : stone_pointer_by_group[<span class="c-global">g</span>+1] ]</code></div>
+      <div class="c-dim" style="font-size:.8rem;margin-top:.3rem">Standard CSR dereference. The global group id <em>g</em> indexes the pointer array to get a contiguous slice of stone coordinates.</div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<section>
+<h2>3. Concrete Example: Batch of 2 Boards</h2>
+
+<div id="example-boards" class="interactive-wrap">
+  <div>
+    <div class="board-panel">
+      <div class="board-title c-board">Board 0 <span class="c-dim">(5×5)</span></div>
+      <div id="board0" style="display:grid;grid-template-columns:repeat(5,1fr);gap:4px;justify-items:center"></div>
+    </div>
+  </div>
+  <div>
+    <div class="board-panel">
+      <div class="board-title c-board">Board 1 <span class="c-dim">(5×5)</span></div>
+      <div id="board1" style="display:grid;grid-template-columns:repeat(5,1fr);gap:4px;justify-items:center"></div>
+    </div>
+  </div>
+</div>
+
+<div id="csr-arrays" class="csr-demo" style="margin-top:1rem">
+  <div style="font-size:.85rem;font-weight:600;margin-bottom:1rem;color:var(--heading)">CSR arrays built from these boards:</div>
+
+  <div class="label"><div class="dot" style="background:var(--csr-offset)"></div><span class="c-offset">group_offset_by_board</span> <span class="c-dim">(B+1,) = (3,)</span></div>
+  <div class="arr" id="arr-offset"></div>
+  <div class="c-dim" style="font-size:.76rem;margin:.3rem 0 1rem;font-family:'Source Code Pro',monospace">Board 0 has 3 groups (offset 0→3), Board 1 has 2 groups (offset 3→5)</div>
+
+  <div class="label"><div class="dot" style="background:var(--csr-ptr)"></div><span class="c-ptr">stone_pointer_by_group</span> <span class="c-dim">(R+1,) = (6,)</span></div>
+  <div class="arr" id="arr-ptr"></div>
+
+  <div class="label" style="margin-top:1rem"><div class="dot" style="background:var(--csr-stones)"></div><span class="c-stones">stone_point_ids</span> <span class="c-dim">(K,)</span></div>
+  <div class="arr" id="arr-stones"></div>
+
+  <div class="label" style="margin-top:1rem"><div class="dot" style="background:var(--csr-lut)"></div><span class="c-lut">group_local_id_by_root_point</span> <span class="c-dim">(B, N2) — only root entries shown</span></div>
+  <div id="lut-display" style="font-family:'Source Code Pro',monospace;font-size:.78rem;line-height:1.7;margin-top:.3rem"></div>
+</div>
+
+<div id="lookup-demo" class="board-panel" style="margin-top:1rem">
+  <div style="font-size:.85rem;font-weight:600;margin-bottom:.8rem;color:var(--heading)">Click any stone above to trace the two-layer lookup</div>
+  <div id="trace-output" class="mono" style="font-size:.82rem;line-height:1.8;white-space:pre;color:var(--dim)">← click a stone on either board</div>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<section>
+<h2>4. Mapping to board_rules_checker.py</h2>
+
+<h3>The GroupCsr dataclass <span class="c-dim" style="font-weight:400;font-size:.85rem">(line 68)</span></h3>
+<table class="mapping-table">
+<thead><tr><th>Field</th><th>Shape</th><th>Layer</th><th>Role</th></tr></thead>
+<tbody>
+<tr>
+  <td><code class="c-stones">stone_point_ids</code></td>
+  <td><code>(K,) int32</code></td>
+  <td><span class="tag tag-point">point</span></td>
+  <td>Flat array of board-point coordinates for every stone, packed group-by-group across the whole batch</td>
+</tr>
+<tr>
+  <td><code class="c-ptr">stone_pointer_by_group</code></td>
+  <td><code>(R+1,) int32</code></td>
+  <td><span class="tag tag-global">global</span></td>
+  <td>CSR indptr — indexed by <em>batch-global</em> group id to get the stone range</td>
+</tr>
+<tr>
+  <td><code class="c-offset">group_offset_by_board</code></td>
+  <td><code>(B+1,) int32</code></td>
+  <td><span class="tag tag-local">local</span> → <span class="tag tag-global">global</span></td>
+  <td>Cumsum of groups-per-board. Converts local group id to global: <code>global = local + offset[b]</code></td>
+</tr>
+<tr>
+  <td><code class="c-lut">group_local_id_by_root_point</code></td>
+  <td><code>(B, N2) int32</code></td>
+  <td><span class="tag tag-point">point</span> → <span class="tag tag-local">local</span></td>
+  <td>LUT: union-find root point → 0-based local group id. -1 where no group root exists.</td>
+</tr>
+</tbody>
+</table>
+
+<h3>Where each field is built <span class="c-dim" style="font-weight:400;font-size:.85rem">(_build_group_csr, line 491)</span></h3>
+<table class="mapping-table">
+<thead><tr><th>Step</th><th>Code</th><th>What happens</th></tr></thead>
+<tbody>
+<tr>
+  <td>1</td>
+  <td><code>has_stone.nonzero()</code></td>
+  <td>Enumerate all stones as <code>(board_idx, point_idx)</code> pairs</td>
+</tr>
+<tr>
+  <td>2</td>
+  <td><code>group_sort_key.argsort()</code></td>
+  <td>Sort stones by (board, root) so each group is a contiguous run</td>
+</tr>
+<tr>
+  <td>3</td>
+  <td><code>~same_group_as_prev</code></td>
+  <td>Detect CSR run boundaries → <code>group_start_offsets</code> (R groups total)</td>
+</tr>
+<tr>
+  <td>4</td>
+  <td><code>groups_per_board</code> via <code>bincount</code></td>
+  <td>Count groups per board → cumsum gives <code class="c-offset">group_offset_by_board</code></td>
+</tr>
+<tr>
+  <td>5</td>
+  <td><code>global - first_global_per_board</code></td>
+  <td>Subtract board's first global id → 0-based <code class="c-local">local_group_id</code></td>
+</tr>
+<tr>
+  <td>6</td>
+  <td><code>index_put_</code> into LUT</td>
+  <td>Write local ids at root-point positions → <code class="c-lut">group_local_id_by_root_point</code></td>
+</tr>
+<tr>
+  <td>7</td>
+  <td><code>stones_per_group.cumsum()</code></td>
+  <td>Build <code class="c-ptr">stone_pointer_by_group</code> (CSR indptr)</td>
+</tr>
+</tbody>
+</table>
+
+<h3>How captures use the two layers <span class="c-dim" style="font-weight:400;font-size:.85rem">(game_state_machine.py, line 595)</span></h3>
+<div class="code-block"><span class="cm"># 1. BoardRulesChecker outputs LOCAL capture ids per candidate point</span>
+<span class="st">captured_group_local_ids</span>                     <span class="cm"># (B, N2, 4) int32, -1 = no capture</span>
+
+<span class="cm"># 2. GameStateMachine lifts local → global</span>
+<span class="st">captured_global_group_ids</span> = <span class="fn">group_offset_active</span> + safe_local_ids
+
+<span class="cm"># 3. Global id indexes the CSR pointer to get stone ranges</span>
+group_start = <span class="ty">stone_pointer_by_group</span>[captured_global_ids]
+group_end   = <span class="ty">stone_pointer_by_group</span>[captured_global_ids + 1]
+
+<span class="cm"># 4. Stone ranges index into the flat stone array</span>
+captured_point_ids = <span class="kw">stone_point_ids</span>[start : end]
+
+<span class="cm"># 5. Clear those points on the board</span>
+boards[board_idx, captured_point_ids] = Stone.EMPTY</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<section>
+<h2>5. Why Two Layers?</h2>
+
+<table class="mapping-table">
+<thead><tr><th>Concern</th><th>Local IDs alone</th><th>Global IDs alone</th><th>Two layers (actual design)</th></tr></thead>
+<tbody>
+<tr>
+  <td>Per-board reasoning</td>
+  <td>Natural — 0-based per board</td>
+  <td>Need to subtract offset every time</td>
+  <td>Local for per-board logic, global for CSR</td>
+</tr>
+<tr>
+  <td>Batch-wide CSR indexing</td>
+  <td>Can't index a shared array</td>
+  <td>Natural — one flat namespace</td>
+  <td>Global for shared CSR arrays</td>
+</tr>
+<tr>
+  <td>Capture metadata size</td>
+  <td>Small (0..groups_in_board)</td>
+  <td>Large (0..total_groups_in_batch)</td>
+  <td>Store local (small), lift to global only when needed</td>
+</tr>
+<tr>
+  <td>Conversion cost</td>
+  <td>—</td>
+  <td>—</td>
+  <td>One addition: <code>local + offset[b]</code></td>
+</tr>
+</tbody>
+</table>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<section>
+<h2>6. CSR Vocabulary Reference</h2>
+<table class="mapping-table">
+<thead><tr><th>Name</th><th>Shape</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>K</code></td><td>scalar</td><td>Total stones across the entire batch</td></tr>
+<tr><td><code>R</code></td><td>scalar</td><td>Total groups across the entire batch</td></tr>
+<tr><td><code>B</code></td><td>scalar</td><td>Batch size (number of boards)</td></tr>
+<tr><td><code>N2</code></td><td>scalar</td><td>Board area = board_size²</td></tr>
+<tr><td><code>stone_point_ids</code></td><td><code>(K,)</code></td><td>Point coordinates of all stones, group-major</td></tr>
+<tr><td><code>stone_pointer_by_group</code></td><td><code>(R+1,)</code></td><td>CSR indptr: group <em>g</em>'s stones are at indices <code>[ptr[g], ptr[g+1])</code></td></tr>
+<tr><td><code>group_offset_by_board</code></td><td><code>(B+1,)</code></td><td>Cumsum of groups per board: <code>global_id = local_id + offset[b]</code></td></tr>
+<tr><td><code>group_local_id_by_root_point</code></td><td><code>(B, N2)</code></td><td>Root point → local group id lookup table</td></tr>
+<tr><td><code>captured_group_local_ids</code></td><td><code>(B, N2, 4)</code></td><td>Per candidate point, up to 4 capturable groups (local ids, -1 = none)</td></tr>
+</tbody>
+</table>
+</section>
+
+<div class="footer">crs_explanation.html &mdash; visual companion to engine/board_rules_checker.py</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<script>
+(function(){
+  const H = 5, N2 = H * H;
+
+  // Board 0: Black group at {6,7,11}, Black group at {16}, White group at {12,13,17,18}
+  // Board 1: Black group at {0,1,5}, White group at {23,24}
+  const boards = [
+    new Int8Array(N2),
+    new Int8Array(N2),
+  ];
+  // Board 0
+  [6,7,11].forEach(p => boards[0][p] = 1);      // Black group A (root=6)
+  [16].forEach(p => boards[0][p] = 1);           // Black group B (root=16)
+  [12,13,17,18].forEach(p => boards[0][p] = 2);  // White group C (root=12)
+  // Board 1
+  [0,1,5].forEach(p => boards[1][p] = 1);        // Black group D (root=0)
+  [23,24].forEach(p => boards[1][p] = 2);         // White group E (root=23)
+
+  // Precomputed group info
+  const groupInfo = [
+    // Board 0: 3 groups
+    { root: 6,  localId: 0, color: 1, stones: [6, 7, 11] },
+    { root: 12, localId: 1, color: 2, stones: [12, 13, 17, 18] },
+    { root: 16, localId: 2, color: 1, stones: [16] },
+  ];
+  const groupInfoB1 = [
+    // Board 1: 2 groups
+    { root: 0,  localId: 0, color: 1, stones: [0, 1, 5] },
+    { root: 23, localId: 1, color: 2, stones: [23, 24] },
+  ];
+  const allGroups = [...groupInfo, ...groupInfoB1];
+
+  // CSR arrays
+  const groupOffsetByBoard = [0, 3, 5];  // Board 0 has 3 groups, Board 1 has 2
+  const stonePointerByGroup = [0, 3, 7, 8, 11, 13];  // 5 groups + sentinel
+  const stonePointIds = [6, 7, 11, 12, 13, 17, 18, 16, 0, 1, 5, 23, 24];
+
+  // Root → local id LUT (only root entries)
+  const lut = [
+    { board: 0, root: 6,  localId: 0 },
+    { board: 0, root: 12, localId: 1 },
+    { board: 0, root: 16, localId: 2 },
+    { board: 1, root: 0,  localId: 0 },
+    { board: 1, root: 23, localId: 1 },
+  ];
+
+  // Build root lookup for click handler
+  const rootByStone = [{}, {}];
+  groupInfo.forEach(g => g.stones.forEach(s => rootByStone[0][s] = g.root));
+  groupInfoB1.forEach(g => g.stones.forEach(s => rootByStone[1][s] = g.root));
+
+  const localIdByRoot = [{}, {}];
+  groupInfo.forEach(g => localIdByRoot[0][g.root] = g.localId);
+  groupInfoB1.forEach(g => localIdByRoot[1][g.root] = g.localId);
+
+  const colorNames = { 0: 'EMPTY', 1: 'BLACK', 2: 'WHITE' };
+  const colorCSS = { 0: 'var(--dim)', 1: '#e8eef4', 2: '#888' };
+  const colorBg = { 0: 'transparent', 1: '#e8eef4', 2: '#555' };
+
+  function renderBoard(containerId, boardIdx) {
+    const container = document.getElementById(containerId);
+    const board = boards[boardIdx];
+    for (let i = 0; i < N2; i++) {
+      const cell = document.createElement('div');
+      const sz = 34;
+      cell.style.cssText = `width:${sz}px;height:${sz}px;border-radius:50%;border:2px solid var(--border);cursor:pointer;transition:all .15s;display:flex;align-items:center;justify-content:center;font-family:'Source Code Pro',monospace;font-size:.6rem;color:var(--dim);position:relative`;
+      if (board[i] === 1) { cell.style.background = '#e8eef4'; cell.style.color = '#0a0e14'; }
+      else if (board[i] === 2) { cell.style.background = '#555'; cell.style.color = '#ccc'; }
+      cell.textContent = i;
+      cell.dataset.board = boardIdx;
+      cell.dataset.point = i;
+
+      cell.addEventListener('mouseenter', () => {
+        cell.style.borderColor = board[i] !== 0 ? 'var(--csr-stones)' : 'var(--border-bright)';
+        cell.style.transform = 'scale(1.12)';
+      });
+      cell.addEventListener('mouseleave', () => {
+        cell.style.borderColor = 'var(--border)';
+        cell.style.transform = 'scale(1)';
+        cell.style.boxShadow = 'none';
+      });
+      cell.addEventListener('click', () => handleStoneClick(boardIdx, i, board[i]));
+      container.appendChild(cell);
+    }
+  }
+
+  function handleStoneClick(boardIdx, pointId, stoneColor) {
+    const out = document.getElementById('trace-output');
+    if (stoneColor === 0) {
+      out.innerHTML = `<span class="c-point">point_id</span> = ${pointId} on Board ${boardIdx}\n<span class="c-dim">This point is EMPTY — no group here.</span>`;
+      return;
+    }
+
+    const root = rootByStone[boardIdx][pointId];
+    const localId = localIdByRoot[boardIdx][root];
+    const offset = groupOffsetByBoard[boardIdx];
+    const globalId = localId + offset;
+    const ptrStart = stonePointerByGroup[globalId];
+    const ptrEnd = stonePointerByGroup[globalId + 1];
+    const stones = stonePointIds.slice(ptrStart, ptrEnd);
+
+    out.innerHTML =
+      `<span style="color:var(--heading);font-weight:600">Two-layer lookup for point ${pointId} on Board ${boardIdx}:</span>\n\n` +
+      `<span class="c-dim">Step 1: point → root (union-find)</span>\n` +
+      `  <span class="c-point">point_id</span> = ${pointId}  →  root = <span class="c-point">${root}</span>\n\n` +
+      `<span class="c-dim">Step 2: root → local group id (LUT)</span>\n` +
+      `  group_local_id_by_root_point[<span class="c-board">${boardIdx}</span>, <span class="c-point">${root}</span>] = <span class="c-local">${localId}</span>\n\n` +
+      `<span class="c-dim">Step 3: local → global (add board offset)</span>\n` +
+      `  <span class="c-local">${localId}</span> + group_offset_by_board[<span class="c-board">${boardIdx}</span>] = <span class="c-local">${localId}</span> + <span class="c-offset">${offset}</span> = <span class="c-global">${globalId}</span>\n\n` +
+      `<span class="c-dim">Step 4: global → CSR stone range</span>\n` +
+      `  stone_pointer_by_group[<span class="c-global">${globalId}</span>] = <span class="c-ptr">${ptrStart}</span>\n` +
+      `  stone_pointer_by_group[<span class="c-global">${globalId + 1}</span>] = <span class="c-ptr">${ptrEnd}</span>\n\n` +
+      `<span class="c-dim">Step 5: read stone coordinates</span>\n` +
+      `  stone_point_ids[<span class="c-ptr">${ptrStart}</span>:<span class="c-ptr">${ptrEnd}</span>] = <span class="c-stones">[${stones.join(', ')}]</span>\n\n` +
+      `<span style="color:var(--heading)">→ This ${colorNames[stoneColor]} group has ${stones.length} stone${stones.length > 1 ? 's' : ''} at point${stones.length > 1 ? 's' : ''} [${stones.join(', ')}]</span>`;
+  }
+
+  renderBoard('board0', 0);
+  renderBoard('board1', 1);
+
+  // Render CSR array visualizations
+  function renderArr(containerId, values, hlClass, separators) {
+    const container = document.getElementById(containerId);
+    values.forEach((v, i) => {
+      const cell = document.createElement('div');
+      cell.className = `cell ${hlClass}`;
+      if (separators && separators.includes(i)) cell.classList.add('sep');
+      cell.textContent = v;
+      container.appendChild(cell);
+    });
+  }
+
+  renderArr('arr-offset', groupOffsetByBoard, 'hl-offset');
+  renderArr('arr-ptr', stonePointerByGroup, 'hl-ptr');
+  renderArr('arr-stones', stonePointIds, 'hl-stones', [3, 7, 8, 11]);
+
+  // Render LUT display
+  const lutEl = document.getElementById('lut-display');
+  let lutHtml = '';
+  lut.forEach(e => {
+    lutHtml += `  Board <span class="c-board">${e.board}</span>, root <span class="c-point">${String(e.root).padStart(2)}</span> → local_id <span class="c-local">${e.localId}</span>\n`;
+  });
+  lutEl.innerHTML = lutHtml;
+})();
+</script>
+
+</body>
+</html>

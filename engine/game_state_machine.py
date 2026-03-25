@@ -1,7 +1,8 @@
 # engine/game_state_machine.py
 from __future__ import annotations
 
-from typing import Dict, Tuple
+import os
+from typing import Tuple
 
 import torch
 from torch import Tensor
@@ -9,37 +10,70 @@ from torch import Tensor
 
 from .stones import Stone
 from .game_state import GameState
-from .go_legal_checker import GoLegalChecker
+from .board_rules_checker import BoardRulesChecker, LegalInfo
 from utils.shared import timed_method
 
-BoardTensor = Tensor  # (B, H, W)
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Parse a boolean environment flag."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 class GameStateMachine:
     """
     Workspace-owning Go engine.
 
-    - Holds a GoGameState internally as its workspace.
-    - Unwraps tensors once in __init__:
-        self.boards, self.to_play, self.pass_count, self.zobrist_hash
-    - legal_moves() uses internal workspace.
-    - state_transition(actions) mutates internal workspace in-place.
+    Representation policy
+    ---------------------
+    Point identity : ``point_id in [0, N2)``
+    Action identity: ``action_id in [0, N2]``, where ``N2`` = pass
+    Board storage  : ``(B, N2)`` int8
 
-    Features:
-      - Real legality via GoLegalChecker (captures, suicide rules, etc.).
-      - Simple-ko filter: forbid moves whose hash == previous hash only.
-      - Zobrist hashing via precomputed candidate hashes.
+    Public API
+    ----------
+    :meth:`legal_points`            -- ``(B, N2)`` bool, canonical point legality
+    :meth:`state_transition`        -- accepts ``(B,)`` action IDs, canonical
+
+    Action-level semantics (handled by :meth:`state_transition`)
+    -----------------------------------------------------------------
+    - ``action_id in [0, N2)`` -> board placement
+    - ``action_id == N2``      -> pass
+    - Already-finished games (``pass_count >= 2``) are forced to no-op.
+
+    Workspace
+    ---------
+    Holds a GameState internally and unwraps its tensors once in __init__:
+    ``self.boards``, ``self.to_play``, ``self.pass_count``, ``self.zobrist_hash``.
     """
 
     # ------------------------------------------------------------------ #
     # # 1. Construction / setup                                          #
     # ------------------------------------------------------------------ #
-    def __init__(self, game_state: GameState) -> None:
+    def __init__(
+        self,
+        game_state: GameState,
+        alloc_per_call_checker: bool | None = None,
+        no_cache_latest: bool | None = None,
+    ) -> None:
         # keep a reference to the workspace object
         self.state = game_state
 
+        self.alloc_per_call_checker = (
+            _env_flag("GO_ENGINE_ALLOC_PER_CALL_CHECKER", False)
+            if alloc_per_call_checker is None
+            else bool(alloc_per_call_checker)
+        )
+        self.no_cache_latest = (
+            _env_flag("GO_ENGINE_NO_CACHE_LATEST", False)
+            if no_cache_latest is None
+            else bool(no_cache_latest)
+        )
+
         # unwrap tensors as direct references (no clone)
-        self.boards = game_state.boards          # (B, H, W)
+        self.boards = game_state.boards          # (B, N2)
         self.to_play = game_state.to_play        # (B,)
         self.pass_count = game_state.pass_count  # (B,)
         # (B, 2): [:,0]=current hash, [:,1]=previous hash
@@ -52,25 +86,23 @@ class GameStateMachine:
         self.device = game_state.device
 
         # Rules engine
-        self.legal_checker = GoLegalChecker(
+        self.legal_checker = BoardRulesChecker(
             board_size=self.board_size,
             device=self.device,
+            alloc_per_call_checker=self.alloc_per_call_checker,
         )
 
-        # Zobrist + workspaces for candidate-hash building
+        # Zobrist tables for candidate-hash building
         self._init_zobrist_tables()
 
-        # caches for reuse between legal_moves() and state_transition()
-        # Lifetime = “valid for the current board position, until we change state and call
-        self._latest_legal_mask_raw: Tensor | None = None  # before ko-filter
-        self._latest_legal_mask: Tensor | None = None      # after ko-filter
-        self._latest_legal_info: Dict | None = None
+        # Caches -- valid for the current board state until the state changes.
+        self._latest_legal_points_raw: Tensor | None = None   # (B, N2) before ko filter
+        self._latest_legal_points: Tensor | None = None       # (B, N2) after ko filter
+        self._latest_legal_info: LegalInfo | None = None
         self._latest_candidate_hashes: Tensor | None = None
 
-        
-
     # ------------------------------------------------------------------ #
-    # Zobrist init + workspaces                                          #
+    # Zobrist init                                                       #
     # ------------------------------------------------------------------ #
     def _init_zobrist_tables(self) -> None:
         """
@@ -81,51 +113,32 @@ class GameStateMachine:
           - index 0: EMPTY
           - index 1: BLACK
           - index 2: WHITE
-
-        Also allocates:
-          - self._hash_ws : (3, B, N2)   int32  (placement, capture, candidate)
-          - self._cap_vals : (B, N2, 4)  int32  (4-neighbor capture staging)
-          - self._group_xor: (B*N2,)     int32  (per-group XOR scratch)
         """
-        B = self.batch_size
-        H = W = self.board_size
-        N2= H * W
+        N2 = self.N2
         dev = self.device
 
         # Zobrist table for per-intersection states
         g = torch.Generator(device=dev)
         g.manual_seed(42)
 
-        table = torch.randint(
+        Zpos = torch.randint(
             0,
             2**31,
-            (H, W, 3),
+            (N2, 3),
             dtype=torch.int32,
             device=dev,
             generator=g,
         )
-        Zpos = table.view(N2, 3).contiguous()   # (N2, 3)
         self.Zpos = Zpos
         self.ZposT = Zpos.transpose(0, 1).contiguous()  # (3, N2)
-
-        # workspaces (reused every call)
-        self._hash_ws = torch.zeros(
-            (3, B, N2), dtype=torch.int32, device=dev
-        )
-        self._cap_vals = torch.zeros(
-            (B, N2, 4), dtype=torch.int32, device=dev
-        )
-        self._group_xor = torch.zeros(
-            B * N2, dtype=torch.int32, device=dev
-        )
 
     # ------------------------------------------------------------------ #
     # Cache helpers                                                      #
     # ------------------------------------------------------------------ #
     def _invalidate_latest(self) -> None:
         """Invalidate caches after any state-changing operation."""
-        self._latest_legal_mask_raw = None
-        self._latest_legal_mask = None
+        self._latest_legal_points_raw = None
+        self._latest_legal_points = None
         self._latest_legal_info = None
         self._latest_candidate_hashes = None
 
@@ -135,100 +148,59 @@ class GameStateMachine:
     # ------------------------------------------------------------------ #
     
     # ------------------------------------------------------------------ #
-    # 2.1 Public: legal moves (real rules + simple-ko)                       #
+    # 2.1 Public: legal points                                           #
     # ------------------------------------------------------------------ #
     @timed_method
     @torch.no_grad()
-    def legal_moves(self) -> Tensor:
+    def legal_points(self) -> Tensor:
         """
-        Compute legal-move mask using the real rules engine + simple-ko.
-
         Returns
         -------
-        legal_mask : (B, H, W) bool
+        legal_points : (B, N2) bool
+            True where placing a stone is legal (captures, suicide, ko).
+            Does not include pass -- pass is always legal at the action level.
         """
-        # 1) rules-based legality + candidate hashes
-        legal_mask_raw, info, cand_hash = self._get_or_compute_latest()
+        legal_points_raw, _, candidate_hashes = self._get_or_compute_latest()
+        legal_points = self._filter_simple_ko(legal_points_raw, candidate_hashes)
+        self._latest_legal_points = legal_points
+        return legal_points
 
-        # 2) simple-ko filter (previous hash only)
-        legal_mask = self._filter_simple_ko_from_previous(legal_mask_raw, cand_hash)
 
-        # cache ko-filtered mask in case caller wants to inspect it
-        self._latest_legal_mask = legal_mask
-
-        return legal_mask
-
-    
     # ------------------------------------------------------------------ #
     # 2.2 Public: state transition (workspace, in-place)                 #
     # ------------------------------------------------------------------ #
     @torch.no_grad()
-    def state_transition(self, actions: Tensor) -> GameState:
+    def state_transition(self, action_ids: Tensor) -> GameState:
         """
-        Apply one move per game, in-place on the internal workspace.
+        Parameters
+        ----------
+        action_ids : (B,) int
+            ``0 .. N2-1`` = board placement, ``N2`` = pass.
+            Finished games (``pass_count >= 2``) are forced to no-op.
 
-        Inputs
-        ------
-        actions : (B, 2) int
-            (row, col) per game; if row<0 or col<0 => pass.
-
-        Workspace (internal)
-        --------------------
-        self.boards       : (B, H, W) int8
-        self.to_play      : (B,) int8 (0=black, 1=white)
-        self.pass_count   : (B,) int8
-        self.zobrist_hash : (B, 2) int32
-
-        Output
-        ------
-        Returns the same GameState object (mutated).
+        Returns the same GameState object (mutated in-place).
         """
-        boards = self.boards
         to_play = self.to_play
         pass_count = self.pass_count
 
-        # --- 1) ensure candidate hashes from *pre-move* position ---
-        # (reuses cached computations if legal_moves() was just called)
-        legal_mask_raw, info, candidate_hashes = self._get_or_compute_latest()
-        _ = legal_mask_raw  # not used here, but kept for clarity
+        _, legal_info, candidate_hashes = self._get_or_compute_latest()
 
-        # --- 2) normalize actions / masks ---
-        rows, cols, is_pass, finished, play_mask = self._normalize_actions(actions)
+        point_ids, is_pass, finished, play_mask = self._normalize_action_ids(action_ids)
 
-
-        # --- 3) update pass_count ---
         pass_count[:] = torch.where(
             is_pass,
             (pass_count + 1).clamp_max(2),
             torch.zeros_like(pass_count),
         )
 
-        # --- 4) update board: captures + placements ---
-        self._update_board_for_placement_and_capture(
-            rows=rows,
-            cols=cols,
-            play_mask=play_mask,
-            info=info,
-        )
+        self._apply_placement_and_capture(point_ids, play_mask, legal_info)
+        self._apply_zobrist_update(point_ids, is_pass, candidate_hashes)
 
-        # --- 5) update zobrist from precomputed candidates ---
-        self._update_zobrist_for_placement_and_capture(
-            rows=rows,
-            cols=cols,
-            is_pass=is_pass,
-            candidate_hashes=candidate_hashes,
-        )
-
-        # --- 6) flip to_play for non-finished games ---
         flipped = to_play ^ 1
         to_play[:] = torch.where(finished, to_play, flipped)
 
-
-        # --- 7) new state => caches invalid ---
         self._invalidate_latest()
-
-        return self.state  # same object, mutated
-
+        return self.state
 
     # ------------------------------------------------------------------ #
     #  2.3 Public: Game state                                            #
@@ -241,12 +213,9 @@ class GameStateMachine:
         """
         Chinese-style area scoring (stones + surrounded empty territory).
         """
-        B, H, W = self.boards.shape          # boards: (B, H, W)
-        board_flat = self.boards.view(B, -1) # (B, H*W)
-        
-        black_stones = (board_flat == Stone.BLACK).sum(dim=1)  # (B,)
-        white_stones = (board_flat == Stone.WHITE).sum(dim=1)  # (B,)
-        
+        black_stones = (self.boards == Stone.BLACK).sum(dim=1)  # (B,)
+        white_stones = (self.boards == Stone.WHITE).sum(dim=1)  # (B,)
+
         territory = self.legal_checker.compute_territory(self.boards)  # (B, 2)
         black_territory = territory[:, 0]  # (B,)
         white_territory = territory[:, 1]  # (B,)
@@ -313,25 +282,28 @@ class GameStateMachine:
     # ------------------------------------------------------------------ #
 
     @torch.no_grad()
-    def _get_or_compute_latest(self) -> Tuple[Tensor, Dict, Tensor]:
+    def _get_or_compute_latest(self) -> Tuple[Tensor, LegalInfo, Tensor]:
         """
-        Ensure latest legality/candidate info exists for the current state.
+        Ensure latest legality/candidate metadata exists for the current state.
 
         Returns
         -------
-        legal_mask_raw : (B, H, W) bool   – before ko filter
-        info           : dict
-        candidate_hash : (B, N2) int32
+        legal_points_raw   : (B, N2) bool   -- before ko filter
+        legal_info         : LegalInfo
+        candidate_hashes   : (B, N2) int32
         """
+        if self.no_cache_latest:
+            return self._compute_legal_and_candidates(cache_results=False)
+
         if (
-            self._latest_legal_mask_raw is None
+            self._latest_legal_points_raw is None
             or self._latest_legal_info is None
             or self._latest_candidate_hashes is None
         ):
             return self._compute_legal_and_candidates()
 
         return (
-            self._latest_legal_mask_raw,
+            self._latest_legal_points_raw,
             self._latest_legal_info,
             self._latest_candidate_hashes,
         )
@@ -339,83 +311,78 @@ class GameStateMachine:
 
     @timed_method
     @torch.no_grad()
-    def _compute_legal_and_candidates(self) -> Tuple[Tensor, Dict, Tensor]:
+    def _compute_legal_and_candidates(
+        self,
+        cache_results: bool = True,
+    ) -> Tuple[Tensor, LegalInfo, Tensor]:
         """
-        Compute rules-based legality, legal_info, and candidate hashes
+        Compute board-point legality, capture metadata, and candidate hashes
         from the *current* workspace state.
 
         Returns
         -------
-        legal_mask_raw : (B, H, W) bool   – before ko filter
-        info           : dict             – CSR + capture metadata
-        candidate_hash : (B, N2) int32    – Zobrist hashes for placements
+        legal_points_raw   : (B, N2) bool   -- before ko filter
+        legal_info         : LegalInfo       -- CSR + capture metadata
+        candidate_hashes   : (B, N2) int32   -- Zobrist hashes per placement
         """
         boards = self.boards
         to_play = self.to_play
 
-        move_color = torch.where(
-        to_play == 0,
-        torch.full_like(to_play, Stone.BLACK, dtype=torch.int8),
-        torch.full_like(to_play, Stone.WHITE, dtype=torch.int8),
+        to_play_color = torch.where(
+            to_play == 0,
+            torch.full_like(to_play, Stone.BLACK, dtype=torch.int8),
+            torch.full_like(to_play, Stone.WHITE, dtype=torch.int8),
         )
-
-        # torch.where(condition, A, B):
-        # Elementwise: if condition[i] is True → pick A[i], else B[i].
-        
-        legal_mask_raw, info = self.legal_checker.compute_batch_legal_and_info(
+        legal_points_raw, legal_info = self.legal_checker.compute_batch_legal_and_info(
             board=boards,
-            move_color=move_color,
+            to_play_color=to_play_color,
         )
-        candidate_hashes = self._build_candidate_hashes(legal_mask_raw, info)
+        candidate_hashes = self._build_candidate_hashes(legal_info)
 
-        self._latest_legal_mask_raw = legal_mask_raw
-        self._latest_legal_info = info
-        self._latest_candidate_hashes = candidate_hashes
+        if cache_results:
+            self._latest_legal_points_raw = legal_points_raw
+            self._latest_legal_info = legal_info
+            self._latest_candidate_hashes = candidate_hashes
 
-        return legal_mask_raw, info, candidate_hashes
+        return legal_points_raw, legal_info, candidate_hashes
 
     # ------------------------------------------------------------------ #
     # Internal: build candidate hashes for ALL placements                #
     # ------------------------------------------------------------------ #
     @timed_method
     @torch.no_grad()
-    def _build_candidate_hashes(
-        self,
-        legal_mask: BoardTensor,
-        info: Dict,
-    ) -> Tensor:
+    def _build_candidate_hashes(self, legal_info: LegalInfo) -> Tensor:
         """
-        Compute Zobrist hash for *every* candidate next state (one per board point).
+        Compute Zobrist hash for *every* candidate placement (one per point).
 
-        Inputs
-        ------
-        legal_mask : (B, H, W) bool
-        info       : dict  – CSR + capture metadata from GoLegalChecker
+        Pipeline
+        --------
+        1. Placement delta -- XOR for changing empty->stone at each point.
+        2. Per-group capture XOR -- prefix-XOR scan over the CSR stone array
+           produces one XOR delta per batch-global group.
+        3. Local->global mapping -- board-local capture ids from the checker are
+           lifted into batch-global ids via ``group_offset_by_board``,
+           then looked up in the per-group XOR table.
+        4. Per-point capture delta -- XOR the (up to 4) neighbor capture deltas.
+        5. Final hash -- ``current_hash ^ placement_delta ^ capture_delta``.
 
         Returns
         -------
         candidate_hashes : (B, N2) int32
-            Flattened over board positions (row*W + col).
-
-        Side-effects
-        ------------
-        - Writes per-group XOR deltas into info["group_xor_remove_delta"]
-          (kept for potential future use; not needed by this class).
         """
         device = self.device
-        B, H, W = legal_mask.shape
+        B = self.batch_size
         N2 = self.N2
 
-        # Workspaces
-        hash_workspace   = self._hash_ws
-        placement_delta  = hash_workspace[0].view(B, N2)  # (B, N2) int32
-        capture_delta    = hash_workspace[1].view(B, N2)  # (B, N2) int32
-        candidate_hashes = hash_workspace[2].view(B, N2)  # (B, N2) int32
+        # Per-call scratch buffers keep this path simple and stateless.
+        placement_delta = torch.zeros((B, N2), dtype=torch.int32, device=device)
+        capture_delta = torch.zeros((B, N2), dtype=torch.int32, device=device)
+        candidate_hashes = torch.zeros((B, N2), dtype=torch.int32, device=device)
+        cap_vals = torch.zeros((B, N2, 4), dtype=torch.int32, device=device)
+        group_xor_workspace = torch.zeros(B * N2, dtype=torch.int32, device=device)
 
-        cap_vals            = self._cap_vals       # (B, N2, 4) int32
-        group_xor_workspace = self._group_xor      # (B * N2,) int32 – we slice [:R]
-
-        # ---------- 1) placement delta (Zobrist) ----------
+        # ---------- Phase 1: placement delta (Zobrist) ----------
+        # XOR of Z(empty) with Z(new color) for every point.
         current_player = self.to_play.to(torch.int64)   # (B,)
 
         z_empty = self.ZposT[0]  # (N2,) int32
@@ -430,58 +397,58 @@ class GameStateMachine:
         placement_delta[black_turn] ^= z_black.view(1, N2)
         placement_delta[white_turn] ^= z_white.view(1, N2)
 
-        # ---------- 2) CSR pieces ----------
-        stone_global_index             = info["stone_global_index"]               # (K,)   int32
-        stone_global_pointer           = info["stone_global_pointer"]             # (R+1,) int32
-        group_global_pointer_per_board = info["group_global_pointer_per_board"]   # (B+1,) int32
-        captured_group_local_index     = info["captured_group_local_index"]       # (B, N2, 4) int32
+        # ---------- Phase 2: unpack CSR + capture metadata ----------
+        csr = legal_info.csr
+        stone_point_ids = csr.stone_point_ids                     # (K,)   int32
+        stone_pointer_by_group = csr.stone_pointer_by_group       # (R+1,) int32
+        group_offset_by_board = csr.group_offset_by_board         # (B+1,) int32
+        captured_group_local_ids = legal_info.captured_group_local_ids  # (B, N2, 4) int32
 
-        R = int(stone_global_pointer.numel() - 1)
-        K = int(stone_global_index.numel())
+        R = int(stone_pointer_by_group.numel() - 1)
+        K = int(stone_point_ids.numel())
 
         cur_hash = self.zobrist_hash[:, 0]   # (B,) current hash
 
         # trivial case: no groups / no stones → only placement delta
         if R == 0 or K == 0:
-            info["group_xor_remove_delta"] = group_xor_workspace[:0]
-
             capture_delta.zero_()
             candidate_hashes.copy_(cur_hash.view(B, 1))
             candidate_hashes ^= placement_delta
             return candidate_hashes
 
-        # ---------- 3) per-stone capture delta via CSR ----------
-        z_empty_flat = z_empty                    # (N2,) int32
-        z_by_color   = self.ZposT[1:3]            # (2, N2) int32
+        # ---------- Phase 3: per-stone Zobrist delta via CSR ----------
+        # For each stone in the batch, compute d_j = Z(opp) ^ Z(empty).
+        z_by_color = self.ZposT[1:3]               # (2, N2) int32
 
-        groups_per_board      = (group_global_pointer_per_board[1:] - group_global_pointer_per_board[:-1])  # (B,)
+        groups_per_board = (group_offset_by_board[1:] - group_offset_by_board[:-1])  # (B,)
         groups_per_board_long = groups_per_board.to(torch.int64)
 
-        group_board_index = torch.repeat_interleave(
+        board_index_per_global_group = torch.repeat_interleave(
             torch.arange(B, device=device, dtype=torch.int64),
             groups_per_board_long,
         )  # (R,)
 
-        stones_per_group      = (stone_global_pointer[1:] - stone_global_pointer[:-1])   # (R,)
+        stones_per_group = (stone_pointer_by_group[1:] - stone_pointer_by_group[:-1])   # (R,)
         stones_per_group_long = stones_per_group.to(torch.int64)
 
-        group_id_for_stone = torch.repeat_interleave(
+        global_group_index_for_stone = torch.repeat_interleave(
             torch.arange(R, device=device, dtype=torch.int64),
             stones_per_group_long,
         )  # (K,)
 
-        stone_board_index   = group_board_index[group_id_for_stone]  # (K,)
+        stone_board_index   = board_index_per_global_group[global_group_index_for_stone]  # (K,)
         opp_player          = 1 - current_player                     # (B,)
         opp_color_for_stone = opp_player[stone_board_index]          # (K,) ∈ {0,1}
 
-        stone_global_index_long = stone_global_index.to(torch.int64)         # (K,)
-        z_opp = z_by_color[opp_color_for_stone, stone_global_index_long]     # (K,)
-        z_emp = z_empty_flat[stone_global_index_long]                        # (K,)
+        stone_point_ids_long = stone_point_ids.to(torch.int64)         # (K,)
+        z_opp = z_by_color[opp_color_for_stone, stone_point_ids_long]  # (K,)
+        z_emp = z_empty[stone_point_ids_long]                              # (K,)
 
         # d_j = Z(opp at stone j) ^ Z(empty at stone j)
         per_stone_delta = (z_opp ^ z_emp)                                    # (K,)
 
-        # ---------- 4) prefix XOR → per-group XOR ----------
+        # ---------- Phase 4: prefix XOR → per-group capture XOR ----------
+        # Parallel prefix scan turns per-stone deltas into per-group XOR sums.
         prefix = per_stone_delta.clone()  # (K,)
         offset = 1
         while offset < K:
@@ -489,8 +456,8 @@ class GameStateMachine:
             prefix[offset:] ^= prev[:-offset]
             offset <<= 1
 
-        start_idx = stone_global_pointer[:-1].to(torch.int64)  # (R,)
-        end_idx   = stone_global_pointer[1:].to(torch.int64)   # (R,)
+        start_idx = stone_pointer_by_group[:-1].to(torch.int64)  # (R,)
+        end_idx = stone_pointer_by_group[1:].to(torch.int64)     # (R,)
 
         end_pos   = end_idx - 1
         start_pos = start_idx - 1
@@ -507,19 +474,21 @@ class GameStateMachine:
         group_xor_buf = group_xor_workspace[:R]
         group_xor_buf.copy_(group_xor)
 
-        # ---------- 5) reduce 4-neighbour capture delta per cell ----------
-        has_capture = captured_group_local_index >= 0          # (B, N2, 4) bool
+        # ---------- 5) local→global group ids → per-point capture XOR delta ----
+        # captured_group_local_ids uses -1 as NO_CAPTURE sentinel.
+        # Replace sentinels with 0 for safe arithmetic; has_capture masks them out.
+        has_capture = captured_group_local_ids >= 0          # (B, N2, 4) bool
 
-        group_offset_per_board = group_global_pointer_per_board[:-1].view(B, 1, 1)  # (B,1,1)
+        group_offset_per_board = group_offset_by_board[:-1].view(B, 1, 1)
 
-        cap_vals = self._cap_vals  # alias
-        cap_vals.copy_(captured_group_local_index.clamp_min(0))
-        cap_vals.add_(group_offset_per_board)
+        safe_local_ids = captured_group_local_ids.clamp_min(0)
+        cap_vals.copy_(safe_local_ids)
+        cap_vals.add_(group_offset_per_board)                  # now batch-global group ids
 
         if group_xor_buf.numel() and has_capture.any():
-            flat_group_ids = cap_vals[has_capture].to(torch.int64)  # (K',)
+            global_group_gather_idx = cap_vals[has_capture].to(torch.int64)
             cap_vals.zero_()
-            cap_vals[has_capture] = group_xor_buf[flat_group_ids].to(torch.int32)
+            cap_vals[has_capture] = group_xor_buf[global_group_gather_idx].to(torch.int32)
         else:
             cap_vals.zero_()
 
@@ -529,88 +498,63 @@ class GameStateMachine:
         capture_delta ^= cap_vals[..., 2]
         capture_delta ^= cap_vals[..., 3]
 
-        # ---------- 6) build candidate hashes ----------
+        # ---------- Phase 6: assemble candidate hashes ----------
         candidate_hashes.copy_(cur_hash.view(B, 1))
         candidate_hashes ^= placement_delta
-        candidate_hashes ^= capture_delta   #(B,M)
+        candidate_hashes ^= capture_delta
 
-
-        return candidate_hashes             #(B,M)
+        return candidate_hashes             # (B, N2)
 
     # ------------------------------------------------------------------ #
-    # Simple-ko filter from previous hash                                #
+    # Simple-ko filter                                                   #
     # ------------------------------------------------------------------ #
     @torch.no_grad()
-    def _filter_simple_ko_from_previous(
+    def _filter_simple_ko(
         self,
-        legal_mask: BoardTensor,
-        candidate_hashes: Tensor,  # (B, N2)
-    ) -> BoardTensor:
+        legal_points: Tensor,       # (B, N2) bool
+        candidate_hashes: Tensor,   # (B, N2) int32
+    ) -> Tensor:
         """
-        Simple ko: forbid moves whose candidate hash equals *previous* hash.
-
-        Assumes:
-          self.zobrist_hash: (B, 2) int32
-            [:, 0] = current hash
-            [:, 1] = previous hash
+        Simple ko: forbid placements whose candidate hash equals the
+        *previous* board hash.  Returns (B, N2) bool.
         """
-        B, H, W = legal_mask.shape
-        prev_hash = self.zobrist_hash[:, 1]        # (B,)
-        ko_flat = (candidate_hashes == prev_hash.view(B, 1))  # (B, N2) bool
-        ko_mask = ko_flat.view(B, H, W)
-        return legal_mask & ~ko_mask
+        B = legal_points.shape[0]
+        prev_hash = self.zobrist_hash[:, 1]                     # (B,)
+        ko_mask = (candidate_hashes == prev_hash.view(B, 1))    # (B, N2)
+        return legal_points & ~ko_mask
 
     # ------------------------------------------------------------------ #
-    # 4. Action normalization + state updates                            #
+    # 4. Action normalization                                            #
     # ------------------------------------------------------------------ #
-
-    # ------------------------------------------------------------------ #
-    # Internal: normalize actions / masks                                #
-    # ------------------------------------------------------------------ #
-    def _normalize_actions(
+    def _normalize_action_ids(
         self,
-        actions: Tensor,  # (B, 2)
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        action_ids: Tensor,  # (B,)
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
-        Normalize actions and compute masks based on internal workspace.
+        Classify each action as placement, pass, or terminal no-op.
 
-        Inputs
-        ------
-        actions : (B, 2) int  (row, col), negative => pass
+        Parameters
+        ----------
+        action_ids : (B,) int
+            ``0..N2-1`` = board placement, ``N2`` = pass.
 
         Returns
         -------
-        rows      : (B,) long - effective rows (with forced passes)
-        cols      : (B,) long - effective cols
-        is_pass   : (B,) bool - True where pass
-        finished  : (B,) bool - pass_count >= 2 before this move
-        play_mask : (B,) bool - True where we actually place stones
+        point_ids : (B,) long -- point index (clamped safe for indexing)
+        is_pass   : (B,) bool
+        finished  : (B,) bool -- pass_count >= 2
+        play_mask : (B,) bool -- actually placing a stone
         """
-        device = self.device
-        actions = actions.to(device)
+        N2 = self.N2
+        action_ids = action_ids.to(self.device).long()
 
-        rows = actions[:, 0]
-        cols = actions[:, 1]
+        finished = self.pass_count >= 2
+        is_pass = (action_ids >= N2) | finished
+        play_mask = ~is_pass
 
-        pass_count = self.pass_count  # already on device
+        point_ids = action_ids.clamp(max=N2 - 1)
 
-        # games already finished (2 passes)
-        finished = pass_count >= 2  # (B,) bool
-
-        # finished games are forced to pass (no effect on board)
-        eff_rows = torch.where(finished, torch.full_like(rows, -1), rows)
-        eff_cols = torch.where(finished, torch.full_like(cols, -1), cols)
-
-        # pass if row<0 or col<0
-        is_pass = (eff_rows < 0) | (eff_cols < 0)
-
-        # games where we actually place stones this step
-        play_mask = (~is_pass) & (~finished)  # (B,)
-
-
-        
-
-        return eff_rows.long(), eff_cols.long(), is_pass, finished, play_mask
+        return point_ids, is_pass, finished, play_mask
 
 
 
@@ -619,146 +563,113 @@ class GameStateMachine:
     # Board update: placements + captures                                #
     # ------------------------------------------------------------------ #
     @torch.no_grad()
-    def _update_board_for_placement_and_capture(
+    def _apply_placement_and_capture(
         self,
-        rows: Tensor,         # (B,) long effective rows (may be -1)
-        cols: Tensor,         # (B,) long effective cols
+        point_ids: Tensor,    # (B,) long -- point index
         play_mask: Tensor,    # (B,) bool
-        info: Dict,
+        legal_info: LegalInfo,
     ) -> None:
         """
-        Apply captures (if any) and then place stones on the board for the
-        subset of games that actually played (play_mask == True).
+        Apply captures (if any) then place stones for games where
+        ``play_mask`` is True.
         """
         if not play_mask.any():
-            return  # no actual placements this ply
+            return
 
         dev = self.device
         B = self.batch_size
-        H = W = self.board_size
         N2 = self.N2
-
         boards = self.boards
 
-        # Subset of boards that actually play
-        active_idx = play_mask.nonzero(as_tuple=True)[0]  # (M,)
-        r_play = rows[active_idx].to(torch.int64)         # (M,)
-        c_play = cols[active_idx].to(torch.int64)         # (M,)
-        lin_pos = r_play * W + c_play                     # (M,)
+        active_idx = play_mask.nonzero(as_tuple=True)[0]           # (M,)
+        active_point_ids = point_ids[active_idx].to(torch.int64)   # (M,)
 
-        # Player index: 0 = black to move, 1 = white to move
-        player_idx = self.to_play[active_idx]             # (M,) int8
-
-        # Map player index -> board stone encoding (Stone.BLACK / Stone.WHITE).
-        # This keeps the board representation independent of the to_play convention
-        # and remains correct if Stone uses {EMPTY=0, BLACK=1, WHITE=2}.
+        player_idx = self.to_play[active_idx]                      # (M,) int8
         current_color = torch.where(
             player_idx == 0,
             torch.full_like(player_idx, Stone.BLACK, dtype=torch.int8),
             torch.full_like(player_idx, Stone.WHITE, dtype=torch.int8),
-        ).to(torch.int64)                                  # (M,)
+        )                                                          # (M,) int8
 
         # CSR / capture metadata
-        captured_group_local_index = info["captured_group_local_index"]          # (B, N2, 4) int32
-        group_global_pointer_per_board = info["group_global_pointer_per_board"]  # (B+1,) int32
-        stone_global_pointer = info["stone_global_pointer"]                      # (R+1,) int32
-        stone_global_index = info["stone_global_index"]                          # (K,)   int32
+        csr = legal_info.csr
+        captured_group_local_ids = legal_info.captured_group_local_ids      # (B, N2, 4) int32
+        group_offset_by_board = csr.group_offset_by_board                    # (B+1,) int32
+        stone_pointer_by_group = csr.stone_pointer_by_group                  # (R+1,) int32
+        stone_point_ids = csr.stone_point_ids                                # (K,)   int32
 
-        # ---- Captured groups for each played move ----
-        local_group_ids_4 = captured_group_local_index[active_idx, lin_pos]  # (M, 4)
-        valid_slots = (local_group_ids_4 >= 0)                               # (M, 4) bool
+        captured_group_local_ids_active = captured_group_local_ids[active_idx, active_point_ids]  # (M, 4)
+        valid_capture_slots = (captured_group_local_ids_active >= 0)                             # (M, 4)
 
-        group_offsets = group_global_pointer_per_board[active_idx].unsqueeze(1)  # (M,1)
-        global_group_ids_4 = group_offsets + local_group_ids_4.clamp_min(0)     # (M,4) int32
+        group_offset_active = group_offset_by_board[active_idx].unsqueeze(1)  # (M, 1)
+        safe_local_ids = captured_group_local_ids_active.clamp_min(0)
+        captured_global_group_ids = group_offset_active + safe_local_ids
 
         # ---- Apply captures: clear stones in captured groups ----
-        flat_valid = valid_slots.view(-1)
-        if flat_valid.any():
-            captured_groups_flat = global_group_ids_4.view(-1)[flat_valid]       # (L,) int32
+        valid_slots_packed = valid_capture_slots.view(-1)
+        if valid_slots_packed.any():
+            captured_global_ids = captured_global_group_ids.view(-1)[valid_slots_packed]
 
-            captured_groups_flat_long = captured_groups_flat.to(torch.int64)
-            stone_global_pointer_long = stone_global_pointer.to(torch.int64)
+            captured_global_ids_long = captured_global_ids.to(torch.int64)
+            stone_pointer_by_group_long = stone_pointer_by_group.to(torch.int64)
 
-            group_start = stone_global_pointer_long[captured_groups_flat_long]        # (L,) long
-            group_end = stone_global_pointer_long[captured_groups_flat_long + 1]      # (L,) long
-            stones_per_group = (group_end - group_start)                              # (L,) long
+            group_start = stone_pointer_by_group_long[captured_global_ids_long]
+            group_end = stone_pointer_by_group_long[captured_global_ids_long + 1]
+            stones_per_group = (group_end - group_start)
 
-            # Which board each captured group belongs to
-            groups_per_move = valid_slots.sum(1).to(torch.int64)                  # (M,)
+            groups_per_move = valid_capture_slots.sum(1).to(torch.int64)
             board_for_group = torch.repeat_interleave(
                 active_idx.to(torch.int64), groups_per_move
-            )                                                                    # (L,)
+            )
 
             total_captured = int(stones_per_group.sum())
             if total_captured > 0:
-                # Reconstruct stone indices for all captured groups
                 group_id_for_stone = torch.repeat_interleave(
-                    torch.arange(captured_groups_flat_long.numel(), device=dev, dtype=torch.int64),
+                    torch.arange(captured_global_ids_long.numel(), device=dev, dtype=torch.int64),
                     stones_per_group,
-                )                                                                # (S,)
-                start_for_stone = group_start[group_id_for_stone]                # (S,)
+                )
+                start_for_stone = group_start[group_id_for_stone]
                 prefix_lengths = torch.cumsum(
                     torch.nn.functional.pad(stones_per_group, (1, 0)), 0
-                )[:-1]                                                           # (L,)
+                )[:-1]
                 pos_in_group = (
                     torch.arange(total_captured, device=dev, dtype=torch.int64)
                     - prefix_lengths[group_id_for_stone]
                 )
 
-                stone_index_in_csr = start_for_stone + pos_in_group              # (S,)
-                stone_global_index_long = stone_global_index.to(torch.int64)
-                captured_lin = stone_global_index_long[stone_index_in_csr]       # (S,)
+                stone_index_in_csr = start_for_stone + pos_in_group
+                stone_point_ids_long = stone_point_ids.to(torch.int64)
+                captured_point_ids = stone_point_ids_long[stone_index_in_csr]
                 board_for_stone = torch.repeat_interleave(
                     board_for_group, stones_per_group
-                )                                                                # (S,)
+                )
 
-                flat_board = boards.view(-1)                                     # (B * N2,) int8
-                lin_board_cell = board_for_stone * N2 + captured_lin             # (S,) long
-                flat_board[lin_board_cell] = Stone.EMPTY
+                boards_linear = boards.view(-1)
+                captured_linear_idx = board_for_stone * N2 + captured_point_ids
+                boards_linear[captured_linear_idx] = Stone.EMPTY
 
-        # ---- Finally, place the new stones ----
-        boards[active_idx, r_play, c_play] = current_color.to(boards.dtype)
+        # ---- Place new stones ----
+        boards_linear = boards.view(-1)
+        placement_linear_idx = active_idx.to(torch.int64) * N2 + active_point_ids
+        boards_linear[placement_linear_idx] = current_color
 
     # ------------------------------------------------------------------ #
-    # Zobrist update: placements + captures                             #
+    # Zobrist update                                                     #
     # ------------------------------------------------------------------ #
     @torch.no_grad()
-    def _update_zobrist_for_placement_and_capture(
+    def _apply_zobrist_update(
         self,
-        rows: Tensor,
-        cols: Tensor,
-        is_pass: Tensor,
-        candidate_hashes: Tensor,
+        point_ids: Tensor,         # (B,) long -- point index
+        is_pass: Tensor,           # (B,) bool
+        candidate_hashes: Tensor,  # (B, N2) int32
     ) -> None:
-        B = self.batch_size
-        H = self.board_size
-    
         zob = self.zobrist_hash          # (B, 2) int32
         cur = zob[:, 0]                  # (B,) current
         prev = zob[:, 1]                 # (B,) previous
-    
 
-    
-        # 1) shift ring buffer: prev := old current
         prev[:] = cur
-    
-        # 2) for non-pass moves, update current from candidate table
-        play_mask = ~is_pass             # (B,) bool
 
-        # total = play_mask.numel()                     # total length B
-        # num_true = int(play_mask.sum().item())       # True count
-        # num_false = total - num_true                 # False count
-        
-        # print("_update_zobrist_for_placement_and_captur", f"play_mask: total={total}, true={num_true}, false={num_false}")
-
-    
+        play_mask = ~is_pass
         if play_mask.any():
-            idx = play_mask.nonzero(as_tuple=True)[0]   # (M,)
-            r = rows[idx]                               # (M,)
-            c = cols[idx]                               # (M,)
-            lin = r * H + c                             # (M,) long
-    
-            cur[idx] = candidate_hashes[idx, lin]       # pick new hash for that move
-
-
-#-----------end of  engine/game_state_machine.py-----------------
+            idx = play_mask.nonzero(as_tuple=True)[0]
+            cur[idx] = candidate_hashes[idx, point_ids[idx]]

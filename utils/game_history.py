@@ -20,10 +20,10 @@ class GameHistory:
     device: torch.device
 
     # ---- main buffers (allocated in __post_init__) ----
-    boards: Tensor = field(init=False)   # (B_tracked, T_max+1, H, H)
+    boards: Tensor = field(init=False)   # (B_tracked, T_max+1, N2)
     to_play: Tensor = field(init=False)  # (B_tracked, T_max+1)
     hashes: Tensor = field(init=False)   # (B_tracked, T_max+1)
-    moves:  Tensor = field(init=False)   # (B_tracked, T_max, 2)
+    action_ids: Tensor = field(init=False)   # (B_tracked, T_max)
 
     # ---- final info (set in finalize) ----
     finished: Optional[Tensor] = None    # (B_tracked,)
@@ -40,12 +40,13 @@ class GameHistory:
         B = self.B_tracked
         T = self.T_max
         H = self.H
+        N2 = H * H
         d = self.device
 
-        self.boards = torch.empty((B, T + 1, H, H), dtype=torch.int8,  device=d)
+        self.boards = torch.empty((B, T + 1, N2), dtype=torch.int8,  device=d)
         self.to_play = torch.empty((B, T + 1),      dtype=torch.int8,  device=d)
         self.hashes = torch.empty((B, T + 1),       dtype=torch.int32, device=d)
-        self.moves  = torch.empty((B, T,     2),    dtype=torch.int64, device=d)
+        self.action_ids  = torch.empty((B, T),      dtype=torch.int64, device=d)
 
     # ---------- in-place finalize ----------
 

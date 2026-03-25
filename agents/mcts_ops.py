@@ -23,36 +23,21 @@ def _log(debug: bool, *parts) -> None:
 
 
 # ---------------------------------------------------------------------
-# Shared action <-> move helper
+# Adapter: action IDs <-> (row, col) for debug / presentation only
 # ---------------------------------------------------------------------
 
 
-def actions_to_moves(actions: Tensor, board_size: int) -> Tensor:
+def action_ids_to_rc(action_ids: Tensor, board_size: int) -> Tensor:
     """
-    Convert flat action indices to (row, col) moves, vectorized.
+    Convert flat action indices to (row, col).  Debug / presentation only.
 
-    Convention:
-      - 0 .. board_size^2-1 => board points
-      - board_size^2        => pass => (-1, -1)
-
-    Parameters
-    ----------
-    actions : Tensor
-        Tensor of any shape (...,) containing action indices.
-    board_size : int
-        Board size H (assuming H == W).
-
-    Returns
-    -------
-    moves : Tensor
-        Tensor of shape (..., 2), same leading shape as `actions`,
-        dtype long, where pass actions are mapped to (-1, -1).
+    ``0..N2-1`` -> ``(row, col)``, ``N2`` -> ``(-1, -1)`` (pass).
     """
-    dev = actions.device
+    dev = action_ids.device
     H = int(board_size)
     pass_idx = H * H
 
-    flat = actions.view(-1)  # (N,)
+    flat = action_ids.view(-1)
     rows = flat // H
     cols = flat % H
 
@@ -64,7 +49,12 @@ def actions_to_moves(actions: Tensor, board_size: int) -> Tensor:
     if is_pass.any():
         moves[is_pass] = -1
 
-    return moves.view(*actions.shape, 2)
+    return moves.view(*action_ids.shape, 2)
+
+
+# Keep old name as a convenience alias
+# Prefer `action_ids_to_rc` in new code.
+actions_to_moves = action_ids_to_rc
 
 
 # ============================================================================
@@ -89,17 +79,17 @@ def run_mcts_root(
          Walk down the current search tree using the PUCT rule until we
          reach a leaf node (unexpanded / terminal / depth-limited).
 
-      2. RECONSTRUCT LEAF POSITION:
-         Rebuild the concrete Go position at the leaf as a fresh
+      2. RECONSTRUCT LEAF STATE:
+         Rebuild the concrete Go state at the leaf as a fresh
          GameStateMachine by replaying actions from the root.
 
-      3. EXPANSION:
+          3. EXPANSION:
          At that leaf engine state:
-           - Expand it by computing the legal moves and assigning a prior P.
-             (Currently: uniform prior over legal moves. Later: NN policy.)
+           - Expand it by computing the legal placement mask and assigning a prior P.
+             (Currently: uniform prior over legal actions. Later: NN policy.)
 
       4. EVALUATION:
-         Evaluate the leaf position to obtain a scalar value v from the
+         Evaluate the leaf state to obtain a scalar value v from the
          *leaf player's* point of view (currently via game_outcomes; later NN).
 
       5. BACKUP:
@@ -114,15 +104,14 @@ def run_mcts_root(
 
     Returns
     -------
-    actions : (B,) long
-        Chosen action index for each game:
+    action_ids : (B,) long
+        Chosen action ID for each game:
           0 .. H*H-1 => board point
           H*H        => pass
     """
-    # Use legal_moves to recover (B, H, W) and sanity-check board size
-    legal_mask_2d = root_game_state_machine.legal_moves()  # (B, H, W)
-    B, H, W = legal_mask_2d.shape
-    assert H == W == tree.board_size, "Tree and engine board sizes must match"
+    B = tree.B
+    assert root_game_state_machine.board_size == tree.board_size, \
+        "Tree and engine board sizes must match"
 
     # Which games are already finished at the real root?
     game_over_at_root = root_game_state_machine.is_game_over()  # (B,)
@@ -134,7 +123,7 @@ def run_mcts_root(
     for sim in range(num_simulations):
         for b in range(B):
             if bool(game_over_at_root[b].item()):
-                # Real game is already over at the root position
+                # Real game is already over at the root state
                 continue
 
             # Only print for game b == 0
@@ -153,7 +142,7 @@ def run_mcts_root(
                 debug=debug_this,
             )
 
-            # 2) RECONSTRUCT the concrete leaf position as a fresh engine
+            # 2) RECONSTRUCT the concrete leaf state as a fresh engine
             engine = mcts_reconstruct_leaf_position(
                 tree=tree,
                 root_engine=root_game_state_machine,
@@ -162,7 +151,7 @@ def run_mcts_root(
                 debug=debug_this,
             )
 
-            # 3) EXPANSION: legal moves + priors + terminal flag (if needed)
+            # 3) EXPANSION: legal placements + priors + terminal flag (if needed)
             mcts_expansion_phase(
                 tree=tree,
                 engine=engine,
@@ -196,13 +185,13 @@ def run_mcts_root(
     # ----------------------------------------------------------------------
     # ROOT ACTION SELECTION – choose an action per game from root visits
     # ----------------------------------------------------------------------
-    actions = mcts_choose_action_from_root_phase(
+    action_ids = mcts_choose_action_from_root_phase(
         tree=tree,
         game_over_at_root=game_over_at_root,
         debug=debug,
     )
 
-    return actions
+    return action_ids
 
 
 # Backwards-compatible alias for the old name
@@ -240,7 +229,6 @@ def mcts_selection_phase(
     """
     b = game_index
     dev = tree.device
-    H = tree.board_size
     A = tree.A
 
     node = int(tree.root_index[b].item())  # typically 0
@@ -287,7 +275,7 @@ def mcts_selection_phase(
 
         U = c_puct * P_row * sqrt_N_parent / (1.0 + N_child)
         scores = Q_child + U
-        scores[~legal] = -1e9  # mask illegal moves (pass is always legal)
+        scores[~legal] = -1e9  # mask illegal actions (pass is always legal)
 
         if torch.all(scores <= -1e8):
             tree.is_terminal[b, node] = True
@@ -317,11 +305,6 @@ def mcts_selection_phase(
             tree.parent[b, child_n] = node
             tree.parent_action[b, child_n] = a_sel
             tree.depth[b, child_n] = depth + 1
-
-            # Store move (row, col) from parent uniformly (pass or point)
-            a_tensor = torch.tensor([a_sel], dtype=torch.long, device=dev)
-            rc = actions_to_moves(a_tensor, H)[0]  # (2,)
-            tree.move_pos_from_parent[b, child_n] = rc.to(torch.int8)
 
             # Player to move at child
             tree.to_play[b, child_n] = tree.to_play[b, node] ^ 1
@@ -367,14 +350,13 @@ def mcts_reconstruct_leaf_position(
     debug: bool = False,
 ) -> GameStateMachine:
     """
-    Helper: reconstruct the concrete Go position at a leaf node as a fresh
+    Helper: reconstruct the concrete Go state at a leaf node as a fresh
     GameStateMachine by replaying all actions from the game's root.
 
     This is logically between SELECTION and (EXPANSION, EVALUATION).
     """
     b = game_index
     dev = tree.device
-    H = tree.board_size
 
     # Recover the action sequence root -> leaf in tree space
     actions_list: List[int] = []
@@ -396,25 +378,24 @@ def mcts_reconstruct_leaf_position(
     )
 
     # Clone root state for game b
-    boards = root_engine.boards[b : b + 1].clone()              # (1, H, W)
+    boards = root_engine.boards[b : b + 1].clone()              # (1, N2)
     to_play = root_engine.to_play[b : b + 1].clone()            # (1,)
     pass_count = root_engine.pass_count[b : b + 1].clone()      # (1,)
     zobrist_hash = root_engine.zobrist_hash[b : b + 1].clone()  # (1, 2)
 
     state = GameState(
         boards=boards,
+        board_size=root_engine.board_size,
         to_play=to_play,
         pass_count=pass_count,
         zobrist_hash=zobrist_hash,
     )
     engine = GameStateMachine(state)
 
-    # Replay actions to get to leaf position
-    if len(actions_list) > 0:
-        a_tensor = torch.tensor(actions_list, dtype=torch.long, device=dev)  # (L,)
-        moves_seq = actions_to_moves(a_tensor, H)  # (L, 2)
-        for m in moves_seq:
-            engine.state_transition(m.view(1, 2))
+    # Replay actions to get to leaf state
+    for a in actions_list:
+        action_id = torch.tensor([a], dtype=torch.long, device=dev)
+        engine.state_transition(action_id)
 
     return engine
 
@@ -436,7 +417,7 @@ def mcts_expansion_phase(
 
       - Decide whether the leaf node should be expanded (non-terminal and
         below max depth, and not yet expanded).
-      - If so, compute its legal moves and assign a prior over actions P.
+      - If so, compute its legal placement mask and assign a prior over actions P.
       - Mark terminal nodes when appropriate.
 
     Invariant under this design:
@@ -450,7 +431,7 @@ def mcts_expansion_phase(
 
     depth = int(tree.depth[b, leaf_index].item())
 
-    # Check if game is over at this leaf position
+    # Check if game is over at this leaf state
     is_over = bool(engine.is_game_over()[0].item())
     _log(
         debug,
@@ -461,11 +442,10 @@ def mcts_expansion_phase(
     if (not is_over) and (depth < tree.max_depth) and (
         not bool(tree.is_expanded[b, leaf_index].item())
     ):
-        legal_mask_2d = engine.legal_moves()    # (1, H, W) bool
-        legal_flat = legal_mask_2d.view(-1)     # (H*H,)
+        legal_points = engine.legal_points()    # (1, N2) bool
 
         legal = torch.zeros(A, dtype=torch.bool, device=dev)
-        legal[: H * H] = legal_flat
+        legal[:A - 1] = legal_points.view(-1)
         legal[pass_idx] = True  # allow pass whenever the game is alive
 
         tree.legal[b, leaf_index] = legal
@@ -618,7 +598,7 @@ def mcts_choose_action_from_root_phase(
     A = tree.A
     pass_idx = tree.pass_idx
 
-    actions = torch.full((B,), pass_idx, dtype=torch.long, device=dev)
+    action_ids = torch.full((B,), pass_idx, dtype=torch.long, device=dev)
     root = 0  # local root index per game
 
     legal_root = tree.legal[:, root, :]              # (B, A)
@@ -627,7 +607,7 @@ def mcts_choose_action_from_root_phase(
     for b in range(B):
         if bool(game_over_at_root[b].item()):
             # If game is already over, just pass.
-            actions[b] = pass_idx
+            action_ids[b] = pass_idx
             continue
 
         # Under our design assumptions, root should have been expanded
@@ -648,11 +628,11 @@ def mcts_choose_action_from_root_phase(
             child_nodes = child_row[has_child]
             visits[has_child] = tree.N[b, child_nodes].to(torch.float32)
 
-        # Mask out illegal moves (pass is guaranteed legal by construction)
+        # Mask out illegal actions (pass is guaranteed legal by construction)
         visits[~legal] = -1e9
 
         a_best = int(torch.argmax(visits).item())
-        actions[b] = a_best
+        action_ids[b] = a_best
 
         if debug and b == 0:
             topk = torch.topk(visits, k=min(5, A))
@@ -662,5 +642,5 @@ def mcts_choose_action_from_root_phase(
                 f"top_visits={[(int(idx), float(val)) for val, idx in zip(topk.values, topk.indices)]}",
             )
 
-    return actions
+    return action_ids
 

@@ -26,7 +26,7 @@ mastering_go_cat_RL_cuda/
 │   ├── stones.py                  #   Stone enum: EMPTY=0, BLACK=1, WHITE=2
 │   ├── game_state.py              #   GameState dataclass (boards, to_play, pass_count, zobrist)
 │   ├── game_state_machine.py      #   GameStateMachine — legal moves, state transitions, scoring
-│   └── go_legal_checker.py        #   GoLegalChecker — union-find groups, CSR captures, territory
+│   └── board_rules_checker.py     #   BoardRulesChecker — union-find groups, CSR captures, territory
 │
 ├── agents/                        # Bot implementations
 │   ├── random_bot.py              #   RandomBot — uniform sampling over legal actions
@@ -65,7 +65,7 @@ Everything operates on **B games in parallel** as `(B, H, W)` tensors.
 `GameStateMachine` is the central object. It wraps a `GameState` and mutates it
 in place through two main methods:
 
-- **`legal_moves()`** — calls `GoLegalChecker` to compute union-find groups,
+- **`legal_moves()`** — calls `BoardRulesChecker` to compute union-find groups,
   CSR-packed capture metadata, and per-move Zobrist candidate hashes, then
   applies a simple-ko filter. Returns `(B, H, W) bool`.
 

@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Go Engine Naming System</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0d1117;
+  --surface:#161b22;
+  --border:#30363d;
+  --text:#e6edf3;
+  --dim:#8b949e;
+  --accent-point:#f0883e;
+  --accent-board:#58a6ff;
+  --accent-state:#a371f7;
+  --accent-action:#3fb950;
+  --accent-move:#d2a8ff;
+  --code-bg:#1c2128;
+  --hover:#21262d;
+}
+body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;line-height:1.6;padding:2rem;max-width:1100px;margin:0 auto}
+code,pre{font-family:'JetBrains Mono',monospace}
+h1{font-size:2rem;font-weight:700;margin-bottom:.3rem;letter-spacing:-.02em}
+.subtitle{color:var(--dim);font-size:1rem;margin-bottom:2.5rem}
+
+.hero{display:grid;grid-template-columns:repeat(5,1fr);gap:.75rem;margin-bottom:2.5rem}
+@media(max-width:700px){.hero{grid-template-columns:repeat(3,1fr)}}
+.word-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.2rem 1rem;text-align:center;transition:transform .15s,border-color .15s;cursor:default}
+.word-card:hover{transform:translateY(-3px)}
+.word-card.point{border-color:var(--accent-point)}
+.word-card.board{border-color:var(--accent-board)}
+.word-card.state{border-color:var(--accent-state)}
+.word-card.action{border-color:var(--accent-action)}
+.word-card.move{border-color:var(--accent-move)}
+.word-card .label{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:1.1rem;margin-bottom:.4rem}
+.word-card.point .label{color:var(--accent-point)}
+.word-card.board .label{color:var(--accent-board)}
+.word-card.state .label{color:var(--accent-state)}
+.word-card.action .label{color:var(--accent-action)}
+.word-card.move .label{color:var(--accent-move)}
+.word-card .desc{color:var(--dim);font-size:.82rem;line-height:1.4}
+
+section{margin-bottom:2.5rem}
+section h2{font-size:1.25rem;font-weight:700;margin-bottom:1rem;padding-bottom:.5rem;border-bottom:1px solid var(--border)}
+
+.nest{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.5rem;font-family:'JetBrains Mono',monospace;font-size:.85rem;line-height:1.8;overflow-x:auto;white-space:pre}
+.k{font-weight:700}
+.k-state{color:var(--accent-state)}
+.k-board{color:var(--accent-board)}
+.k-point{color:var(--accent-point)}
+.dim{color:var(--dim)}
+
+.examples{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+@media(max-width:700px){.examples{grid-template-columns:1fr}}
+.ex-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+.ex-card .ex-header{padding:.7rem 1rem;font-size:.8rem;font-weight:600;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:.5rem}
+.ex-card .ex-header .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.ex-card .ex-body{padding:1rem;font-family:'JetBrains Mono',monospace;font-size:.82rem;line-height:1.7;white-space:pre;overflow-x:auto}
+.comment{color:var(--dim)}
+.hl-point{color:var(--accent-point)}
+.hl-board{color:var(--accent-board)}
+.hl-state{color:var(--accent-state)}
+.hl-action{color:var(--accent-action)}
+.hl-move{color:var(--accent-move)}
+
+.layers{display:flex;flex-direction:column;gap:0;margin-bottom:1rem}
+.layer-row{display:flex;align-items:stretch;min-height:90px}
+.layer-label{width:180px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-family:'JetBrains Mono',monospace;font-weight:700;font-size:.9rem;border:1px solid var(--border);padding:.5rem}
+.layer-content{flex:1;border:1px solid var(--border);border-left:none;padding:1rem 1.2rem;display:flex;flex-direction:column;justify-content:center;font-size:.85rem;line-height:1.7}
+.layer-row:first-child .layer-label,.layer-row:first-child .layer-content{border-radius:12px 12px 0 0}
+.layer-row:last-child .layer-label,.layer-row:last-child .layer-content{border-radius:0 0 12px 12px}
+.layer-row.l-engine .layer-label{background:rgba(88,166,255,.12);color:var(--accent-board)}
+.layer-row.l-agent .layer-label{background:rgba(63,185,80,.12);color:var(--accent-action)}
+.layer-row.l-history .layer-label{background:rgba(210,168,255,.12);color:var(--accent-move)}
+.layer-content code{background:var(--code-bg);padding:.15rem .4rem;border-radius:4px;font-size:.8rem}
+.tag{display:inline-block;padding:.1rem .5rem;border-radius:6px;font-size:.72rem;font-weight:600;font-family:'JetBrains Mono',monospace;margin-right:.3rem}
+.tag-point{background:rgba(240,136,62,.15);color:var(--accent-point)}
+.tag-board{background:rgba(88,166,255,.15);color:var(--accent-board)}
+.tag-state{background:rgba(163,113,247,.15);color:var(--accent-state)}
+.tag-action{background:rgba(63,185,80,.15);color:var(--accent-action)}
+.tag-move{background:rgba(210,168,255,.15);color:var(--accent-move)}
+
+table{width:100%;border-collapse:collapse;font-size:.85rem}
+th{text-align:left;padding:.6rem .8rem;border-bottom:2px solid var(--border);color:var(--dim);font-weight:600;font-size:.78rem;text-transform:uppercase;letter-spacing:.04em}
+td{padding:.55rem .8rem;border-bottom:1px solid var(--border)}
+td code{background:var(--code-bg);padding:.1rem .35rem;border-radius:4px;font-size:.8rem}
+tr:hover td{background:var(--hover)}
+
+.footer{text-align:center;color:var(--dim);font-size:.78rem;margin-top:2rem;padding-top:1.5rem;border-top:1px solid var(--border)}
+</style>
+</head>
+<body>
+
+<h1>Go Engine Naming System</h1>
+<div class="subtitle">One word, one meaning. Five words cover everything.</div>
+
+<!-- ═══ FIVE WORDS ═══ -->
+<div class="hero">
+  <div class="word-card point">
+    <div class="label">point</div>
+    <div class="desc">one intersection<br>on the board</div>
+  </div>
+  <div class="word-card board">
+    <div class="label">board</div>
+    <div class="desc">the stone map<br>(all points together)</div>
+  </div>
+  <div class="word-card state">
+    <div class="label">state</div>
+    <div class="desc">board + game context<br>(turns, ko, passes)</div>
+  </div>
+  <div class="word-card action">
+    <div class="label">action</div>
+    <div class="desc">what the engine<br>does this turn</div>
+  </div>
+  <div class="word-card move">
+    <div class="label">move</div>
+    <div class="desc">what a human reads<br>in the game record</div>
+  </div>
+</div>
+
+<!-- ═══ NESTING ═══ -->
+<section>
+<h2>How They Nest</h2>
+<div class="nest"><span class="k k-state">state</span> <span class="dim">(GameState object)</span>
+ ├── <span class="k k-board">boards</span> ─────── <span class="dim">(B, N2) int8     stone at every</span> <span class="k k-point">point</span>
+ ├── to_play ───── <span class="dim">(B,)   int8     whose turn</span>
+ ├── pass_count ── <span class="dim">(B,)   int8     consecutive passes</span>
+ └── zobrist_hash  <span class="dim">(B, 2) int32    current + previous hash</span></div>
+</section>
+
+<!-- ═══ CODE EXAMPLES ═══ -->
+<section>
+<h2>Code Examples</h2>
+<div class="examples">
+
+  <div class="ex-card">
+    <div class="ex-header"><div class="dot" style="background:var(--accent-point)"></div>What's at this point?</div>
+    <div class="ex-body"><span class="comment"># point_id is the address</span>
+<span class="comment"># boards is the container</span>
+stone = engine.<span class="hl-board">boards</span>[b, <span class="hl-point">point_id</span>]</div>
+  </div>
+
+  <div class="ex-card">
+    <div class="ex-header"><div class="dot" style="background:var(--accent-board)"></div>Which points are legal?</div>
+    <div class="ex-body"><span class="comment"># returns (B, N2) bool</span>
+<span class="comment"># one bool per point, all games</span>
+legal = engine.<span class="hl-board">legal_points</span>()</div>
+  </div>
+
+  <div class="ex-card">
+    <div class="ex-header"><div class="dot" style="background:var(--accent-point)"></div>Place a stone at a point</div>
+    <div class="ex-body"><span class="comment"># direct write to the board</span>
+engine.<span class="hl-board">boards</span>[b, <span class="hl-point">point_id</span>] = Stone.BLACK</div>
+  </div>
+
+  <div class="ex-card">
+    <div class="ex-header"><div class="dot" style="background:var(--accent-action)"></div>Apply a chosen action</div>
+    <div class="ex-body"><span class="comment"># action_id in [0, N2]</span>
+<span class="comment"># N2 = pass, 0..N2-1 = place</span>
+engine.<span class="hl-action">state_transition</span>(<span class="hl-action">action_ids</span>)</div>
+  </div>
+
+  <div class="ex-card">
+    <div class="ex-header"><div class="dot" style="background:var(--accent-board)"></div>Show board to a human</div>
+    <div class="ex-body"><span class="comment"># reshape for 2D display</span>
+<span class="comment"># no adapter API needed</span>
+boards_2d = engine.<span class="hl-board">boards</span>.view(B, H, H)</div>
+  </div>
+
+  <div class="ex-card">
+    <div class="ex-header"><div class="dot" style="background:var(--accent-move)"></div>Write a game record</div>
+    <div class="ex-body"><span class="comment"># human-facing JSON entry</span>
+{
+  "<span class="hl-move">move_number</span>": ply + 1,
+  "<span class="hl-action">action_id</span>": a,
+  "row": r, "col": c
+}</div>
+  </div>
+
+</div>
+</section>
+
+<!-- ═══ LAYERS ═══ -->
+<section>
+<h2>Naming by Layer</h2>
+<div class="layers">
+  <div class="layer-row l-engine">
+    <div class="layer-label">Engine</div>
+    <div class="layer-content">
+      <div><span class="tag tag-state">state</span> <span class="tag tag-board">board</span> <span class="tag tag-point">point</span> <span class="tag tag-action">action</span></div>
+      <div style="margin-top:.5rem"><code>legal_points()</code> &nbsp; <code>state_transition(action_ids)</code></div>
+      <div style="margin-top:.3rem;color:var(--dim);font-size:.8rem">1D canonical. No <code>_flat</code> suffix needed.</div>
+    </div>
+  </div>
+  <div class="layer-row l-agent">
+    <div class="layer-label">Agents / Search</div>
+    <div class="layer-content">
+      <div><span class="tag tag-action">action_id</span> <span class="tag tag-action">action_ids</span> <span class="tag tag-point">point_id</span></div>
+      <div style="margin-top:.5rem"><code>select_actions(engine)</code> returns <code>(B,)</code> action IDs</div>
+      <div style="margin-top:.3rem;color:var(--dim);font-size:.8rem">Agents consume <code>legal_points</code>, produce <code>action_ids</code>.</div>
+    </div>
+  </div>
+  <div class="layer-row l-history">
+    <div class="layer-label">History / Log</div>
+    <div class="layer-content">
+      <div><span class="tag tag-move">move</span> <span class="tag tag-move">move_number</span> <span class="tag tag-action">action_id</span></div>
+      <div style="margin-top:.5rem">JSON: <code>{"move_number": 42, "action_id": 15, "row": 1, "col": 6}</code></div>
+      <div style="margin-top:.3rem;color:var(--dim);font-size:.8rem">Human-readable <code>move</code> + machine-traceable <code>action_id</code>.</div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ═══ INTERACTIVE BOARD ═══ -->
+<section>
+<h2>Point vs Board &mdash; Interactive</h2>
+<div style="display:flex;gap:2rem;align-items:flex-start;flex-wrap:wrap">
+  <div style="flex:1;min-width:260px">
+    <div style="font-family:'JetBrains Mono',monospace;font-size:.85rem;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.2rem;line-height:2">
+      <div style="text-align:center;margin-bottom:.8rem;color:var(--accent-board);font-weight:700">boards[b]  (5x5)</div>
+      <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px;justify-items:center" id="miniboard"></div>
+      <div style="text-align:center;margin-top:.8rem;color:var(--dim);font-size:.75rem">click any intersection</div>
+    </div>
+  </div>
+  <div style="flex:1;min-width:260px">
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.2rem;font-family:'JetBrains Mono',monospace;font-size:.85rem;line-height:1.8;white-space:pre" id="info-display"><span class="comment"># click a point on the board</span></div>
+  </div>
+</div>
+</section>
+
+<!-- ═══ VOCAB TABLE ═══ -->
+<section>
+<h2>Canonical Vocabulary</h2>
+<table>
+<thead><tr><th>Name</th><th>What it is</th><th>Shape / Domain</th></tr></thead>
+<tbody>
+<tr><td><code>state</code></td><td>Full game snapshot</td><td>GameState object</td></tr>
+<tr><td><code>boards</code></td><td>Stone occupancy</td><td>(B, N2) int8</td></tr>
+<tr><td><code>to_play</code></td><td>Side to move</td><td>(B,) int8</td></tr>
+<tr><td><code>pass_count</code></td><td>Consecutive passes</td><td>(B,) int8</td></tr>
+<tr><td><code>zobrist_hash</code></td><td>Board hashes</td><td>(B, 2) int32</td></tr>
+<tr><td><code>legal_points</code></td><td>Placement legality</td><td>(B, N2) bool</td></tr>
+<tr><td><code>action_id</code></td><td>One action</td><td>int in [0, N2]</td></tr>
+<tr><td><code>action_ids</code></td><td>Batched actions</td><td>(B,) int64</td></tr>
+<tr><td><code>point_id</code></td><td>One board point</td><td>int in [0, N2)</td></tr>
+<tr><td><code>point_ids</code></td><td>Batched points</td><td>(B,) int64</td></tr>
+<tr><td><code>ply</code></td><td>Simulation step</td><td>0-based int</td></tr>
+<tr><td><code>move_number</code></td><td>Human step</td><td>1-based (ply + 1)</td></tr>
+</tbody>
+</table>
+</section>
+
+<div class="footer">naming.html &mdash; visual companion to naming.md</div>
+
+<script>
+(function(){
+  const H=5, N2=H*H;
+  const stones = new Array(N2).fill(0);
+  stones[6]=1; stones[7]=1; stones[11]=1; stones[16]=1;
+  stones[12]=2; stones[13]=2; stones[17]=2; stones[18]=2;
+  const names = {0:'EMPTY',1:'BLACK',2:'WHITE'};
+  const grid = document.getElementById('miniboard');
+  const info = document.getElementById('info-display');
+  let selected = null;
+
+  for(let i=0;i<N2;i++){
+    const cell = document.createElement('div');
+    const sz = 36;
+    cell.style.cssText = `width:${sz}px;height:${sz}px;border-radius:50%;border:2px solid var(--border);cursor:pointer;transition:all .15s;display:flex;align-items:center;justify-content:center;font-size:.6rem;color:var(--dim);position:relative`;
+    if(stones[i]===1){cell.style.background='#e6edf3';cell.style.color='#0d1117'}
+    else if(stones[i]===2){cell.style.background='#555';cell.style.color='#ccc'}
+    cell.textContent = i;
+    cell.dataset.idx = i;
+
+    cell.addEventListener('mouseenter',()=>{
+      cell.style.borderColor='var(--accent-point)';
+      cell.style.transform='scale(1.15)';
+    });
+    cell.addEventListener('mouseleave',()=>{
+      if(selected!==i) cell.style.borderColor='var(--border)';
+      cell.style.transform='scale(1)';
+    });
+    cell.addEventListener('click',()=>{
+      if(selected!==null){
+        const prev=grid.children[selected];
+        prev.style.borderColor='var(--border)';
+        prev.style.boxShadow='none';
+      }
+      selected=i;
+      cell.style.borderColor='var(--accent-point)';
+      cell.style.boxShadow='0 0 0 3px rgba(240,136,62,.25)';
+
+      const r=Math.floor(i/H), c=i%H;
+      const s=stones[i];
+      info.innerHTML =
+        '<span class="hl-point">point_id</span> = '+i+'\n'
+        +'<span class="dim">row = '+r+', col = '+c+'</span>\n\n'
+        +'<span class="comment"># What\'s at this point?</span>\n'
+        +'engine.<span class="hl-board">boards</span>[b, <span class="hl-point">'+i+'</span>]\n'
+        +'  \u2192 Stone.<span style="font-weight:700">'+names[s]+'</span>\n\n'
+        +'<span class="comment"># point = address ('+i+')</span>\n'
+        +'<span class="comment"># board = the whole (B, '+N2+') tensor</span>\n\n'
+        +'<span class="comment"># Is this point legal?</span>\n'
+        +'engine.<span class="hl-board">legal_points</span>()[b, <span class="hl-point">'+i+'</span>]';
+    });
+    grid.appendChild(cell);
+  }
+})();
+</script>
+
+</body>
+</html>

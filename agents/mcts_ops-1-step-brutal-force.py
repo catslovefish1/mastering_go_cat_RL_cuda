@@ -21,7 +21,7 @@ def run_mcts_random_root(
     Greedy root search using compute_scores on a GameStateMachine, fully batched:
 
       - Use root_game_state_machine (physics on root_state) to:
-          * get legal moves at the root
+          * get legal placement mask at the root
           * read root tensors (boards, to_play, pass_count, zobrist_hash)
       - Collect all legal (b,a) pairs into a single big batch of size K.
       - Clone those K root states into a batched eval_game_state_machine.
@@ -38,22 +38,20 @@ def run_mcts_random_root(
     """
 
     # --- 1) legal mask at the root (on root_game_state_machine) ---
-    legal_mask_2d = root_game_state_machine.legal_moves()  # (B, H, W) bool
-    B, H, W = legal_mask_2d.shape
-    assert H == W == tree.board_size, "Tree and GameStateMachine board sizes must match"
+    legal_points = root_game_state_machine.legal_points()  # (B, N2) bool
+    B, N2 = legal_points.shape
+    H = tree.board_size
+    assert H * H == N2, "Tree and GameStateMachine board sizes must match"
 
     dev = root_game_state_machine.device
     A = tree.A
     root = 0
-    pass_idx = H * W
-
-    # flatten legal board points
-    flat_legal = legal_mask_2d.view(B, H * W)  # (B, H*W)
-    has_legal = flat_legal.any(dim=1)          # (B,)
+    pass_idx = N2
+    has_legal = legal_points.any(dim=1)          # (B,)
 
     # build per-action legal mask at root
     root_legal = torch.zeros((B, A), dtype=torch.bool, device=dev)
-    root_legal[:, : H * W] = flat_legal
+    root_legal[:, :N2] = legal_points
 
     # After: pass is always allowed as a root action
     root_legal[:, pass_idx] = True
@@ -76,7 +74,7 @@ def run_mcts_random_root(
 
     # --- 3) build batched root successor states for those K pairs ---
     # NOTE: root_game_state_machine is read-only; we clone from its tensors.
-    boards_eval       = root_game_state_machine.boards[b_idx].clone()        # (K, H, W)
+    boards_eval       = root_game_state_machine.boards[b_idx].clone()        # (K, N2)
     to_play_eval      = root_game_state_machine.to_play[b_idx].clone()       # (K,)
     if debug:
         print("[MCTS_ROOT][debug] to_play_eval (first 3):",
@@ -86,23 +84,16 @@ def run_mcts_random_root(
 
     state_eval = GameState(
         boards=boards_eval,
+        board_size=root_game_state_machine.board_size,
         to_play=to_play_eval,
         pass_count=pass_count_eval,
         zobrist_hash=zobrist_hash_eval,
     )
     eval_game_state_machine = GameStateMachine(state_eval)
 
-    # --- 4) build moves for each (b,a) ---
-    rows = a_idx // H
-    cols = a_idx % H
-    moves_eval = torch.stack([rows, cols], dim=1).to(torch.long).to(dev)  # (K,2)
-
-    # pass actions -> (-1, -1)
-    is_pass = (a_idx == pass_idx)
-    moves_eval[is_pass] = -1
-
-    # apply all moves in parallel (on eval_game_state_machine only)
-    eval_game_state_machine.state_transition(moves_eval)
+    # --- 4) apply all candidate action IDs in parallel ---
+    action_ids_eval = a_idx.to(torch.long).to(dev)  # (K,)
+    eval_game_state_machine.state_transition(action_ids_eval)
 
     # --- 5) score all K successor states in parallel ---
     scores_eval = eval_game_state_machine.compute_scores(komi=komi)  # (K,2) float

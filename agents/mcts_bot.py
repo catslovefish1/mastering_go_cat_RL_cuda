@@ -6,9 +6,8 @@ import torch
 from torch import Tensor
 
 from engine.game_state_machine import GameStateMachine
-from engine.game_state import GameState
 from .mcts_tree import MCTSTree
-from .mcts_ops import run_mcts_root, actions_to_moves
+from .mcts_ops import run_mcts_root
 
 
 # ---------------------------------------------------------------------
@@ -22,14 +21,14 @@ class MCTSBot:
     max_depth: int        # selection depth limit
 
     @torch.no_grad()
-    def select_moves(self, real_game_state_machine: GameStateMachine) -> Tensor:
+    def select_actions(self, real_game_state_machine: GameStateMachine) -> Tensor:
         """
         For now:
           1. Clone rich state from real_game_state_machine into search_state.
           2. Build search_game_state_machine = GameStateMachine(search_state).
           3. Build tree = MCTSTree.from_state(search_state, max_nodes, max_depth).
           4. Call run_mcts_root(...) which will internally run ~max_nodes simulations.
-          5. Convert actions -> (row, col) moves and return.
+          5. Return flat action IDs.
         """
         # 1) clone rich state
         root_state = real_game_state_machine.state.clone()
@@ -48,10 +47,5 @@ class MCTSBot:
             root_game_state_machine=root_game_state_machine,
             debug=True,
         )
-        print(actions.shape)
-        print(actions[:10])
-
-        # 4) convert actions -> (row, col) moves
-        moves = actions_to_moves(actions, board_size=tree.board_size)  # (B, 2)
-        return moves
+        return actions
 

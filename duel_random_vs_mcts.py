@@ -97,22 +97,22 @@ def simulate_batch_games_with_history(
             # # --- choose which bot based on ply ---
             # if ply < max_plies - max_plies:
             #     # all earlier moves: pure random
-            #     moves = bot_A.select_moves(real_state_machine)
+            #     action_ids = bot_A.select_actions(real_state_machine)
             # else:
                 if ply % 2 == 0:
                     over = real_state_machine.is_game_over()
                     print("alive games before MCTS:", (~over).sum().item())
                     # even plies near the end: still random
-                    moves = bot_A.select_moves(real_state_machine)
+                    action_ids = bot_A.select_actions(real_state_machine)
                 else:
                     # odd plies near the end: use MCTS
-                    moves = bot_B.select_moves(real_state_machine)
+                    action_ids = bot_B.select_actions(real_state_machine)
             
-            game_history.moves[:, ply].copy_(moves[:B_tracked])
+            game_history.action_ids[:, ply].copy_(action_ids[:B_tracked])
 
 
 
-            real_state_machine.state_transition(moves)
+            real_state_machine.state_transition(action_ids)
 
 
             # record next state

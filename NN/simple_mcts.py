@@ -43,7 +43,7 @@ class FlatTensorTree:
         self.value_sum = torch.zeros(max_nodes, dtype=torch.float32, device=device)
         self.is_expanded = torch.zeros(max_nodes, dtype=torch.bool, device=device)
         
-        # Hotel room connections - children[room_number, position] = child_room_number
+        # Hotel room connections - children[room_number, action_slot] = child_room_number
         self.children = torch.full((max_nodes, self.num_positions), -1, dtype=torch.int32, device=device)
         
         # Parent tracking for easier navigation
@@ -68,7 +68,7 @@ class FlatTensorTree:
         self.parents[room_idx] = parent_idx
         self.parent_move[room_idx] = move
         
-        # Calculate position slot for this move
+        # Calculate action slot for this move
         if move[0] == -1:  # Pass move
             slot = self.board_size * self.board_size
         else:
@@ -108,15 +108,15 @@ class FlatTensorTree:
         best_idx = ucb_scores.argmax()
         best_child_idx = valid_indices[best_idx]
         
-        # Convert position back to move
-        positions = valid_mask.nonzero().squeeze(-1)
-        best_position = positions[best_idx]
+        # Convert action slot back to move
+        slots = valid_mask.nonzero().squeeze(-1)
+        best_slot = slots[best_idx]
         
-        if best_position == self.num_positions - 1:
+        if best_slot == self.num_positions - 1:
             move = create_pass_positions(1, self.device)[0]
         else:
-            row = best_position // self.board_size
-            col = best_position % self.board_size
+            row = best_slot // self.board_size
+            col = best_slot % self.board_size
             move = torch.stack([row, col])
         
         return move, best_child_idx
@@ -234,7 +234,7 @@ class SimpleMCTS:
         return -child_value
     
     def _expand_and_evaluate(self, board: TensorBoard, node_idx: int) -> Tensor:
-        """Expand node and evaluate position - returns Tensor."""
+        """Expand node and evaluate state - returns Tensor."""
         self._tree.is_expanded[node_idx] = True
         
         # Get legal moves
@@ -242,9 +242,9 @@ class SimpleMCTS:
         
         # Pre-allocate children for all legal moves
         if legal_moves.any():
-            positions = legal_moves.nonzero()
-            for i in range(positions.shape[0]):
-                move = positions[i]
+            slots = legal_moves.nonzero()
+            for i in range(slots.shape[0]):
+                move = slots[i]
                 self._tree.allocate_room(node_idx, move)
         else:
             # Only pass move available
@@ -262,27 +262,27 @@ class SimpleMCTS:
         
         if temperature == 0:
             # Greedy selection
-            best_position = visit_dist.argmax()
+            best_slot = visit_dist.argmax()
         else:
             # Temperature-based sampling
             if visit_dist.sum() == 0:
                 # Uniform random
-                best_position = torch.randint(visit_dist.numel(), (1,), device=self.device)[0]
+                best_slot = torch.randint(visit_dist.numel(), (1,), device=self.device)[0]
             else:
                 probs = torch.pow(visit_dist, 1.0 / temperature)
                 probs = probs / probs.sum()
-                best_position = torch.multinomial(probs, 1)[0]
+                best_slot = torch.multinomial(probs, 1)[0]
         
-        # Convert position to move
-        if best_position == self._board_size * self._board_size:
+        # Convert action slot to move
+        if best_slot == self._board_size * self._board_size:
             return create_pass_positions(1, self.device)[0]
         
-        row = best_position // self._board_size
-        col = best_position % self._board_size
+        row = best_slot // self._board_size
+        col = best_slot % self._board_size
         return torch.stack([row, col])
     
     def _evaluate_terminal(self, board: TensorBoard) -> Tensor:
-        """Evaluate terminal position - returns Tensor."""
+        """Evaluate terminal state - returns Tensor."""
         scores = board.compute_scores()[0]
         score_diff = scores[0] - scores[1]  # black - white
         

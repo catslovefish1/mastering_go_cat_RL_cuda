@@ -70,12 +70,12 @@ def simulate_batch_games_with_history(
 
     print(
         f"intialized boards[0]:",
-        real_state_machine.boards[0].tolist(),
+        real_state_machine.boards.view(num_games, board_size, board_size)[0].tolist(),
     )
 
     print(
         f"intialized boards[0]:",
-        real_state_machine.boards[0].shape,
+        real_state_machine.boards.view(num_games, board_size, board_size)[0].shape,
     )
 
     B_tracked = num_games  # or num_games_to_save if you want
@@ -123,22 +123,22 @@ def simulate_batch_games_with_history(
             # --- choose which bot based on ply ---
             if ply < max_plies-1:
                 # all earlier moves: pure random
-                moves = bot_A.select_moves(real_state_machine)
+                action_ids = bot_A.select_actions(real_state_machine)
             else:
 
                 # last move: use MCTS
                 # print("real_state_last ply_about_to_play")
                 # print("real_state_last ply_to_play", real_state_machine.to_play[0:])
-                moves = bot_B.select_moves(real_state_machine)
+                action_ids = bot_B.select_actions(real_state_machine)
 
-            game_history.moves[:, ply].copy_(moves[:B_tracked])
+            game_history.action_ids[:, ply].copy_(action_ids[:B_tracked])
 
 
-            # print(f"ply {ply} sample moves[0:]:", moves[0:].cpu().tolist())
+            # print(f"ply {ply} sample action_ids[0:]:", action_ids[0:].cpu().tolist())
 
-            real_state_machine.state_transition(moves)
+            real_state_machine.state_transition(action_ids)
 
-            print("real_state.boards[0]", real_state.boards[3])
+            print("real_state.boards[0]", real_state_machine.boards.view(num_games, board_size, board_size)[3])
 
 
             
@@ -180,7 +180,11 @@ def simulate_batch_games_with_history(
     )
 
     print("Sanity check for game_history")
-    pprint(game_history.boards[3].tolist(), width=80, compact=True)
+    pprint(
+        game_history.boards[3].view(game_history.T_actual + 1, board_size, board_size).tolist(),
+        width=80,
+        compact=True,
+    )
 
 
     xxx= game_history.scores[:,0] - game_history.scores[:,1]
@@ -188,7 +192,7 @@ def simulate_batch_games_with_history(
 
     
     # now game_history is your final instance
-    # you can later use game_history.boards, game_history.moves, game_history.T_actual, etc.
+    # you can later use game_history.boards, game_history.action_ids, game_history.T_actual, etc.
 
 
     elapsed = time.time() - t0

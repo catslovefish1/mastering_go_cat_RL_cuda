@@ -14,7 +14,8 @@ class GameState:
     Batched Go state for B parallel games.
     """
 
-    boards: Tensor        # (B, H, W) int8, values in Stone.{EMPTY,BLACK,WHITE}
+    boards: Tensor        # (B, N2) int8, values in Stone.{EMPTY,BLACK,WHITE}
+    board_size: int
     to_play: Tensor       # (B,) int8 (0=black, 1=white)
     pass_count: Tensor    # (B,) int8 (0,1,2)
     zobrist_hash: Tensor  # (B, 2) int32: [:,0]=current, [:,1]=previous
@@ -30,7 +31,7 @@ class GameState:
         return int(self.boards.shape[0])
 
     @property
-    def board_size(self) -> int:
+    def num_points(self) -> int:
         return int(self.boards.shape[-1])
 
     # -------- cloning --------
@@ -42,6 +43,7 @@ class GameState:
         """
         return GameState(
             boards=self.boards.clone(),
+            board_size=self.board_size,
             to_play=self.to_play.clone(),
             pass_count=self.pass_count.clone(),
             zobrist_hash=self.zobrist_hash.clone(),
@@ -54,10 +56,10 @@ def create_empty_game_state(
     device: torch.device,
 ) -> GameState:
     B = batch_size
-    H = W = board_size
+    N2 = board_size * board_size
 
     boards = torch.full(
-        (B, H, W),
+        (B, N2),
         fill_value=Stone.EMPTY,   # uses shared enum
         dtype=torch.int8,
         device=device,
@@ -68,6 +70,7 @@ def create_empty_game_state(
 
     return GameState(
         boards=boards,
+        board_size=board_size,
         to_play=to_play,
         pass_count=pass_count,
         zobrist_hash=zobrist_hash,

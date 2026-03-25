@@ -64,7 +64,7 @@ def simulate_batch_games_with_history(
 
     print(
         f"intialized boards[0]:",
-        real_state_machine.boards[0].cpu().tolist(),
+        real_state_machine.boards.view(num_games, board_size, board_size)[0].cpu().tolist(),
     )
 
     # Two bots: later you can swap random_bot_2 → MCTSBot, etc.
@@ -98,21 +98,19 @@ def simulate_batch_games_with_history(
                 real_state_machine, num_games_to_save
             )
 
-            # --- 2) select moves (this calls real_state_machine.legal_moves()) ---
- 
+            # --- 2) select action IDs (flat-first API) ---
             if ply % 2 == 0:
-                moves = random_bot_1.select_moves(real_state_machine)  # (B,2) long
+                action_ids = random_bot_1.select_actions(real_state_machine)  # (B,) long
             else:
-                moves = random_bot_2.select_moves(real_state_machine)  # (B,2) long
+                action_ids = random_bot_2.select_actions(real_state_machine)  # (B,) long
 
-
-            # --- 3) apply moves to the REAL physics engine ---
-            real_state_machine.state_transition(moves)
+            # --- 3) apply actions to the REAL physics engine ---
+            real_state_machine.state_transition(action_ids)
 
 
             print(
                 f"ply {ply} sample boards for consistency[0]:",
-                real_state_machine.boards[0].cpu().tolist(),
+                real_state_machine.boards.view(num_games, board_size, board_size)[0].cpu().tolist(),
             )
 
             # --- snapshot AFTER the move hash (REAL zobrist) ---
@@ -122,7 +120,8 @@ def simulate_batch_games_with_history(
             record_move_history(
                 move_history=move_history,
                 ply=ply,
-                moves=moves,
+                action_ids=action_ids,
+                board_size=board_size,
                 boards_before=boards_before,
                 to_play_before=to_play_before,
                 hash_before=hash_before,
@@ -213,7 +212,7 @@ def simulate_batch_games_with_history(
 
 if __name__ == "__main__":
     simulate_batch_games_with_history(
-        num_games=2**4,
+        num_games=2**8,
         board_size=9,
         max_plies=10,
         komi=0,

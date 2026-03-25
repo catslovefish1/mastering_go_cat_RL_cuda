@@ -12,7 +12,7 @@ from torch import Tensor
 
 def init_move_history(num_games_to_save: int) -> List[List[Dict]]:
     """
-    Initialize a nested list to store per-move history.
+    Initialize a nested list to store human-facing move records.
 
     Returns
     -------
@@ -28,13 +28,13 @@ def snapshot_pre_move(
     num_games_to_save: int,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """
-    Take a snapshot of engine state *before* a move is applied.
+    Take a snapshot of engine state *before* an action is applied.
 
     Parameters
     ----------
     engine : GoEnginePhysics-like object
         Must expose:
-          - engine.boards       : (B,H,W) int8
+          - engine.boards       : (B,N2) int8
           - engine.to_play      : (B,)    int8
           - engine.zobrist_hash : (B,2)  int32  [:,0] = current
 
@@ -43,7 +43,7 @@ def snapshot_pre_move(
 
     Returns
     -------
-    boards_before : (G,H,W) int8
+    boards_before : (G,N2) int8
         Board snapshots for games 0..G-1.
 
     to_play_before : (B,) int8
@@ -54,7 +54,7 @@ def snapshot_pre_move(
     """
     G = num_games_to_save
 
-    boards_before = engine.boards[:G].clone()        # (G,H,W)
+    boards_before = engine.boards[:G].clone()        # (G,N2)
     to_play_before = engine.to_play.clone()          # (B,)
     hash_before = engine.zobrist_hash[:, 0].clone()  # (B,)
 
@@ -63,58 +63,47 @@ def snapshot_pre_move(
 
 def record_move_history(
     move_history: List[List[Dict]],
-    ply: int,
-    moves: Tensor,                # (B,2) long
-    boards_before: Tensor,        # (G,H,W) int8
+    ply: int,                    # 0-based ply index
+    action_ids: Tensor,           # (B,) long -- flat action IDs
+    board_size: int,
+    boards_before: Tensor,        # (G,N2) int8
     to_play_before: Tensor,       # (B,) int8
     hash_before: Tensor,          # (B,) int32
     hash_after: Tensor,           # (B,) int32
     num_games_to_save: int,
 ) -> None:
     """
-    Append one move record per tracked game (0..G-1) into move_history.
+    Append one human-readable move record per tracked game (0..G-1).
 
     Parameters
     ----------
-    move_history : list[list[dict]]
-        Outer length >= num_games_to_save. Each inner list is appended in-place.
+    action_ids : (B,) long
+        Flat action IDs: ``0..N2-1`` = board placement, ``N2`` = pass.
+        This is the canonical machine identity for each play.
 
-    ply : int
-        Current ply index (0-based). We store 1-based move_number = ply + 1.
+    board_size : int
+        Side length H (H == W).
 
-    moves : (B,2) long
-        Chosen moves for the ply. (row, col), negative => pass.
-
-    boards_before : (G,H,W) int8
-        Board snapshots for games 0..G-1 before applying the moves.
-
-    to_play_before : (B,) int8
-        Player to move before this ply for all games.
-
-    hash_before : (B,) int32
-        Zobrist current hash before the ply.
-
-    hash_after : (B,) int32
-        Zobrist current hash after the ply.
-
-    num_games_to_save : int
-        Number of leading games actually recorded (G).
+    Other parameters are unchanged from the previous version.
     """
     G = num_games_to_save
-    N = boards_before.shape[-1]   # board_size
+    H = board_size
+    N2 = H * H
 
     for g in range(G):
-        r = int(moves[g, 0].item())
-        c = int(moves[g, 1].item())
-        is_pass = (r < 0) or (c < 0)
+        a = int(action_ids[g].item())
+        is_pass = a >= N2
+        r = -1 if is_pass else a // H
+        c = -1 if is_pass else a % H
 
         player = int(to_play_before[g].item())
         player_str = "B" if player == 0 else "W"
 
-        board_flat = boards_before[g].reshape(-1).tolist()
+        board_flat = boards_before[g].tolist()
 
         move_record: Dict[str, object] = {
-            "move_number": ply + 1,
+            "move_number": ply + 1,  # 1-based human index
+            "action_id": a,
             "row": r,
             "col": c,
             "is_pass": bool(is_pass),
@@ -122,7 +111,7 @@ def record_move_history(
             "player_str": player_str,
             "zobrist_before": int(hash_before[g].item()),
             "zobrist_after": int(hash_after[g].item()),
-            "board_state": board_flat,  # length = N*N
+            "board_state": board_flat,
         }
         move_history[g].append(move_record)
 

@@ -23,13 +23,13 @@ def save_debug_games_minimal(
     T = history.T_actual
     H = history.H
 
-    boards  = history.boards[:B, :T+1].cpu()      # (B, T+1, H, H)
+    boards  = history.boards[:B, :T+1].cpu()      # (B, T+1, N2)
     to_play = history.to_play[:B, :T+1].cpu()     # (B, T+1)
     scores  = history.scores[:B].cpu() if history.scores is not None else None  # (B,2) or None
     
 
     for g in range(B):
-        boards_g  = boards[g].tolist()
+        boards_g  = boards[g].view(T + 1, H, H).tolist()
         to_play_g = to_play[g].tolist()
 
         # --- scores ---
