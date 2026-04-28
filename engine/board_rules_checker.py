@@ -32,7 +32,6 @@ captured_group_local_ids      : (B,N2,4)int32  # per candidate point, up to 4 lo
 
 from __future__ import annotations
 from dataclasses import dataclass
-import os
 from typing import Optional, Tuple
 
 import torch
@@ -54,14 +53,6 @@ NO_CAPTURE = -1
 def _to_gather_index(index_tensor: Tensor) -> Tensor:
     """Replace -1 sentinels with 0 so the tensor can be used in gather/index ops."""
     return index_tensor.clamp_min(0).to(torch.int64)
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    """Parse a boolean environment flag."""
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass(slots=True)
@@ -105,16 +96,10 @@ class BoardRulesChecker:
         self,
         board_size: int = 19,
         device: Optional[torch.device] = None,
-        alloc_per_call_checker: bool | None = None,
     ):
         self.board_size = board_size
         self.N2 = board_size * board_size
         self.device = device
-        self.alloc_per_call_checker = (
-            _env_flag("GO_ENGINE_ALLOC_PER_CALL_CHECKER", False)
-            if alloc_per_call_checker is None
-            else bool(alloc_per_call_checker)
-        )
 
         # UF workspace (lazy, depends on B)
         self._uf_neighbor_parent: Optional[Tensor] = None  # (B,N2,4) int32
@@ -158,6 +143,9 @@ class BoardRulesChecker:
             torch.zeros_like(self.neighbor_point_ids),
         )  # (N2,4) int64
 
+        # int32 identity used as initial parent array in union-find
+        self.point_ids_i32 = torch.arange(N2, dtype=torch.int32, device=dev)
+
     # ------------------------------------------------------------------
     # Top-level: board-point legality + capture metadata (CSR-based)
     # ------------------------------------------------------------------
@@ -194,11 +182,7 @@ class BoardRulesChecker:
         neighbor_root_ids = self._get_neighbor_roots_batch(roots)  # (B,N2,4) int32
 
         to_play_color_3d = to_play_color.view(B, 1, 1)     # (B,1,1), Stone.*
-        opponent_color_3d = torch.where(
-            to_play_color_3d == Stone.BLACK,
-            torch.full_like(to_play_color_3d, Stone.WHITE),
-            torch.full_like(to_play_color_3d, Stone.BLACK),
-        )
+        opponent_color_3d = (3 - to_play_color_3d)          # BLACK(1)↔WHITE(2)
 
         # A) immediate liberties – at least one empty neighbour
         has_any_lib = (
@@ -271,8 +255,7 @@ class BoardRulesChecker:
         )
 
         # Hook & compress (union-find)
-        parent0 = torch.arange(N2, dtype=torch.int32, device=dev)
-        parent  = parent0.unsqueeze(0).repeat(B, 1).contiguous()  # (B,N2)
+        parent = self.point_ids_i32.unsqueeze(0).repeat(B, 1).contiguous()  # (B,N2)
 
         parent = self._hook_and_compress(parent, same_color_edge)
         roots = parent                                                          # (B,N2) int32
@@ -318,12 +301,9 @@ class BoardRulesChecker:
     @timed_method
     def _ensure_uf_workspace(self, B: int, N2: int, dev: torch.device) -> Tensor:
         """
-        One-time allocation of (B, N2, 4) workspace.
+        Reusable allocation of (B, N2, 4) workspace.
         Assumes B, N2, device stay constant for this checker.
         """
-        if self.alloc_per_call_checker:
-            return torch.empty((B, N2, 4), dtype=torch.int32, device=dev)
-
         if self._uf_neighbor_parent is None:
             self._uf_neighbor_parent = torch.empty((B, N2, 4), dtype=torch.int32, device=dev)
             return self._uf_neighbor_parent
@@ -410,10 +390,6 @@ class BoardRulesChecker:
         # Empty points mask
         empties = (board == Stone.EMPTY)                   # (B,N2) bool
 
-        # If no empties at all, territory is zero
-        if not empties.any():
-            return torch.zeros((B, 2), dtype=torch.int32, device=dev)
-
         # Neighbour colours (uses self.boards)
         neighbor_colors = self._get_neighbor_colors_batch()          # (B,N2,4) int8
         neighbor_on_board_b = self.neighbor_on_board.view(1, N2, 4).expand(B, -1, -1)
@@ -426,8 +402,7 @@ class BoardRulesChecker:
             & neighbor_on_board_b
         )                                                         # (B,N2,4) bool
 
-        parent0 = torch.arange(N2, dtype=torch.int32, device=dev)
-        parent = parent0.unsqueeze(0).repeat(B, 1).contiguous()   # (B,N2)
+        parent = self.point_ids_i32.unsqueeze(0).repeat(B, 1).contiguous()   # (B,N2)
         roots = self._hook_and_compress(parent, same_region_edge)  # (B,N2) int32
 
         # Only care about empty points
@@ -461,13 +436,8 @@ class BoardRulesChecker:
         has_black_by_region = torch.zeros(total_regions, dtype=torch.bool, device=dev)
         has_white_by_region = torch.zeros(total_regions, dtype=torch.bool, device=dev)
 
-        if is_black.any():
-            black_keys = region_key_tile[is_black]
-            has_black_by_region[black_keys] = True
-
-        if is_white.any():
-            white_keys = region_key_tile[is_white]
-            has_white_by_region[white_keys] = True
+        has_black_by_region[region_key_tile[is_black]] = True
+        has_white_by_region[region_key_tile[is_white]] = True
 
         # Classification per region: black-only, white-only, or neutral (dame)
         black_only = has_black_by_region & ~has_white_by_region
@@ -504,26 +474,20 @@ class BoardRulesChecker:
         maxK = B * N2           # worst-case stones
         maxR = B * N2           # worst-case groups (overkill but simple)
 
-        if self.alloc_per_call_checker:
-            stone_point_ids_buf = torch.empty(maxK, dtype=torch.int32, device=dev)
-            group_local_id_buf = torch.full((B, N2), NO_GROUP, dtype=torch.int32, device=dev)
-            stone_pointer_buf = torch.empty(maxR + 1, dtype=torch.int32, device=dev)
-            group_offset_buf = torch.empty(B + 1, dtype=torch.int32, device=dev)
-        else:
-            if self._csr_capacity_BN2 < maxK:
-                self._stone_point_ids_buf = torch.empty(maxK, dtype=torch.int32, device=dev)
-                self._group_local_id_buf = torch.full((B, N2), NO_GROUP, dtype=torch.int32, device=dev)
-                self._csr_capacity_BN2 = maxK
+        if self._csr_capacity_BN2 < maxK:
+            self._stone_point_ids_buf = torch.empty(maxK, dtype=torch.int32, device=dev)
+            self._group_local_id_buf = torch.full((B, N2), NO_GROUP, dtype=torch.int32, device=dev)
+            self._csr_capacity_BN2 = maxK
 
-            if self._csr_capacity_R < maxR:
-                self._stone_pointer_buf = torch.empty(maxR + 1, dtype=torch.int32, device=dev)
-                self._group_offset_buf = torch.empty(B + 1, dtype=torch.int32, device=dev)
-                self._csr_capacity_R = maxR
+        if self._csr_capacity_R < maxR:
+            self._stone_pointer_buf = torch.empty(maxR + 1, dtype=torch.int32, device=dev)
+            self._group_offset_buf = torch.empty(B + 1, dtype=torch.int32, device=dev)
+            self._csr_capacity_R = maxR
 
-            stone_point_ids_buf = self._stone_point_ids_buf
-            group_local_id_buf = self._group_local_id_buf
-            stone_pointer_buf = self._stone_pointer_buf
-            group_offset_buf = self._group_offset_buf
+        stone_point_ids_buf = self._stone_point_ids_buf
+        group_local_id_buf = self._group_local_id_buf
+        stone_pointer_buf = self._stone_pointer_buf
+        group_offset_buf = self._group_offset_buf
 
         # 1) Enumerate stones in board point coordinates
         has_stone = self.boards != Stone.EMPTY   # (B,N2)

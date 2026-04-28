@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Analyze Once, Commit Once &mdash; Go Engine Internals</title>
+<link href="https://fonts.googleapis.com/css2?family=Bitter:wght@400;600;700&family=Source+Code+Pro:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0a0e14;
+  --surface:#111820;
+  --surface2:#171e28;
+  --border:#1e2a3a;
+  --border-bright:#2a3a50;
+  --text:#c8d4e0;
+  --dim:#6a7a8e;
+  --heading:#e8eef4;
+
+  --boards:#e8a44a;
+  --toplay:#5eaaf5;
+  --passcount:#b07ee8;
+  --zobrist:#4ec990;
+  --action:#e07070;
+  --legal:#68c4e8;
+  --cache:#e8c85e;
+
+  --code-bg:#0d1219;
+  --hover:#141c26;
+}
+body{background:var(--bg);color:var(--text);font-family:'Bitter',Georgia,serif;line-height:1.7;padding:2.5rem 2rem;max-width:1140px;margin:0 auto}
+code,pre,.mono{font-family:'Source Code Pro',monospace}
+h1{font-size:2.2rem;font-weight:700;color:var(--heading);letter-spacing:-.03em;margin-bottom:.2rem}
+.subtitle{color:var(--dim);font-size:.95rem;margin-bottom:2.8rem;font-style:italic}
+h2{font-size:1.3rem;font-weight:700;color:var(--heading);margin-bottom:1rem;padding-bottom:.6rem;border-bottom:1px solid var(--border)}
+h3{font-size:1.05rem;font-weight:600;color:var(--heading);margin:1.5rem 0 .8rem}
+section{margin-bottom:3rem}
+p{margin-bottom:.8rem}
+a{color:var(--toplay);text-decoration:none}
+a:hover{text-decoration:underline}
+strong{color:var(--heading)}
+
+.c-boards{color:var(--boards)}
+.c-toplay{color:var(--toplay)}
+.c-passcount{color:var(--passcount)}
+.c-zobrist{color:var(--zobrist)}
+.c-action{color:var(--action)}
+.c-legal{color:var(--legal)}
+.c-cache{color:var(--cache)}
+.c-dim{color:var(--dim)}
+
+/* ---- intro cards ---- */
+.intro-grid{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;margin-bottom:1.5rem}
+@media(max-width:700px){.intro-grid{grid-template-columns:1fr}}
+.intro-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1.3rem 1.4rem}
+.intro-card h3{margin:0 0 .5rem;font-size:1rem}
+.intro-card p{margin:0;font-size:.88rem;color:var(--dim);line-height:1.6}
+
+/* ---- register cards ---- */
+.reg-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;margin:1.2rem 0}
+@media(max-width:700px){.reg-grid{grid-template-columns:1fr 1fr}}
+@media(max-width:450px){.reg-grid{grid-template-columns:1fr}}
+.reg-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1rem 1.1rem;position:relative;overflow:hidden}
+.reg-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;border-radius:10px 10px 0 0}
+.reg-card.rc-boards::before{background:var(--boards)}
+.reg-card.rc-toplay::before{background:var(--toplay)}
+.reg-card.rc-passcount::before{background:var(--passcount)}
+.reg-card.rc-zobrist::before{background:var(--zobrist)}
+.reg-card .rc-name{font-family:'Source Code Pro',monospace;font-weight:700;font-size:.85rem;margin-bottom:.15rem}
+.reg-card .rc-shape{font-family:'Source Code Pro',monospace;font-size:.72rem;color:var(--dim);margin-bottom:.4rem}
+.reg-card .rc-bits{font-size:.8rem;color:var(--dim);line-height:1.5}
+.reg-card .rc-bits code{font-size:.72rem;background:var(--code-bg);padding:.06rem .3rem;border-radius:3px}
+
+/* ---- two-column call/response ---- */
+.call-grid{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;margin:1.2rem 0}
+@media(max-width:700px){.call-grid{grid-template-columns:1fr}}
+.call-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1.3rem 1.4rem;position:relative}
+.call-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;border-radius:10px 10px 0 0}
+.call-card.cc-query::before{background:var(--legal)}
+.call-card.cc-commit::before{background:var(--action)}
+.call-card h3{margin:0 0 .6rem;font-size:.95rem}
+.call-card .cc-sig{font-family:'Source Code Pro',monospace;font-size:.82rem;background:var(--code-bg);padding:.5rem .8rem;border-radius:6px;margin-bottom:.7rem;line-height:1.5}
+.call-card .cc-desc{font-size:.85rem;color:var(--dim);line-height:1.6}
+
+/* ---- pipeline ---- */
+.pipeline{display:flex;flex-direction:column;gap:0;margin:1.2rem 0}
+.pipe-row{display:flex;align-items:stretch;min-height:80px}
+@media(max-width:700px){.pipe-row{flex-direction:column}}
+.pipe-label{width:200px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-family:'Source Code Pro',monospace;font-weight:600;font-size:.78rem;border:1px solid var(--border);padding:.5rem .7rem;text-align:center;line-height:1.4}
+@media(max-width:700px){.pipe-label{width:100%}}
+.pipe-content{flex:1;border:1px solid var(--border);border-left:none;padding:.7rem 1.1rem;display:flex;flex-direction:column;justify-content:center;font-size:.84rem;line-height:1.7}
+@media(max-width:700px){.pipe-content{border-left:1px solid var(--border);border-top:none}}
+.pipe-row:first-child .pipe-label,.pipe-row:first-child .pipe-content{border-radius:10px 10px 0 0}
+.pipe-row:last-child .pipe-label,.pipe-row:last-child .pipe-content{border-radius:0 0 10px 10px}
+@media(max-width:700px){
+  .pipe-row:first-child .pipe-label{border-radius:10px 10px 0 0}
+  .pipe-row:first-child .pipe-content{border-radius:0}
+  .pipe-row:last-child .pipe-content{border-radius:0 0 10px 10px}
+  .pipe-row:last-child .pipe-label{border-radius:0}
+}
+.pipe-row.ph-analyze .pipe-label{background:rgba(104,196,232,.08);color:var(--legal)}
+.pipe-row.ph-cache .pipe-label{background:rgba(232,200,94,.08);color:var(--cache)}
+.pipe-row.ph-commit .pipe-label{background:rgba(224,112,112,.08);color:var(--action)}
+.pipe-row.ph-flush .pipe-label{background:rgba(176,126,232,.08);color:var(--passcount)}
+.pipe-content code{background:var(--code-bg);padding:.1rem .35rem;border-radius:4px;font-size:.78rem}
+.pipe-arrow{display:flex;justify-content:center;padding:.1rem 0}
+.pipe-arrow span{display:block;width:2px;height:18px;background:var(--border-bright)}
+
+/* ---- cache table ---- */
+.mapping-table{width:100%;border-collapse:collapse;font-size:.85rem;margin:1rem 0}
+.mapping-table th{text-align:left;padding:.6rem .8rem;border-bottom:2px solid var(--border);color:var(--dim);font-weight:600;font-size:.76rem;text-transform:uppercase;letter-spacing:.04em;font-family:'Source Code Pro',monospace}
+.mapping-table td{padding:.55rem .8rem;border-bottom:1px solid var(--border);vertical-align:top}
+.mapping-table tr:hover td{background:var(--hover)}
+.mapping-table code{background:var(--code-bg);padding:.12rem .4rem;border-radius:4px;font-size:.8rem}
+
+/* ---- code blocks ---- */
+.code-block{background:var(--code-bg);border:1px solid var(--border);border-radius:10px;padding:1.2rem 1.4rem;font-family:'Source Code Pro',monospace;font-size:.8rem;line-height:1.8;overflow-x:auto;white-space:pre;margin:1rem 0}
+.code-block .kw{color:var(--toplay);font-weight:600}
+.code-block .cm{color:var(--dim);font-style:italic}
+.code-block .fn{color:var(--zobrist)}
+.code-block .ty{color:var(--passcount)}
+.code-block .st{color:var(--boards)}
+.code-block .ac{color:var(--action)}
+.code-block .ca{color:var(--cache)}
+
+/* ---- detail boxes ---- */
+.detail-box{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1.3rem 1.4rem;margin:1rem 0;font-size:.85rem;line-height:1.8}
+.detail-box .db-title{font-family:'Source Code Pro',monospace;font-weight:700;font-size:.9rem;margin-bottom:.6rem}
+
+/* ---- cost bar ---- */
+.cost-bar{display:flex;align-items:center;gap:.6rem;margin:.3rem 0;font-size:.78rem;font-family:'Source Code Pro',monospace}
+.cost-bar .cb-label{min-width:160px;color:var(--dim)}
+.cost-bar .cb-bar{height:14px;border-radius:3px;min-width:4px}
+.cost-bar .cb-val{color:var(--dim);font-size:.72rem}
+
+/* ---- scoring flow ---- */
+.scoring-flow{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;margin:1rem 0;font-family:'Source Code Pro',monospace;font-size:.82rem;font-weight:600}
+.sf-box{padding:.45rem .9rem;border-radius:8px;border:1px solid var(--border)}
+.sf-arrow{color:var(--dim);font-size:1.1rem}
+.sf-box.sf-boards{background:rgba(232,164,74,.1);color:var(--boards);border-color:rgba(232,164,74,.3)}
+.sf-box.sf-territory{background:rgba(176,126,232,.1);color:var(--passcount);border-color:rgba(176,126,232,.3)}
+.sf-box.sf-scores{background:rgba(78,201,144,.1);color:var(--zobrist);border-color:rgba(78,201,144,.3)}
+.sf-box.sf-outcome{background:rgba(94,170,245,.1);color:var(--toplay);border-color:rgba(94,170,245,.3)}
+
+/* ---- appendix block ---- */
+.appendix{background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:1.3rem 1.5rem;margin:1.2rem 0;font-size:.85rem;line-height:1.8}
+.appendix .ap-title{font-family:'Source Code Pro',monospace;font-weight:700;font-size:.9rem;margin-bottom:.3rem;color:var(--heading)}
+
+/* ---- mermaid ---- */
+.mermaid-wrap{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1.5rem;margin:1.2rem 0;overflow-x:auto}
+
+.footer{text-align:center;color:var(--dim);font-size:.78rem;margin-top:2.5rem;padding-top:1.5rem;border-top:1px solid var(--border)}
+</style>
+</head>
+<body>
+
+<h1>Analyze Once, Commit Once</h1>
+<div class="subtitle">How a bot queries legal moves and places a stone &mdash; the cache, state, and workspace lifecycle inside the Go engine</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<section>
+<h2>1. The Caller&rsquo;s Contract &mdash; Two Calls per Turn</h2>
+
+<p>From any bot&rsquo;s perspective the engine exposes exactly <strong>two instructions</strong> per turn. Everything else &mdash; union-find, CSR topology, Zobrist hashing, capture resolution &mdash; is machinery hidden behind these two calls.</p>
+
+<div class="call-grid">
+  <div class="call-card cc-query">
+    <h3 class="c-legal">1. Query &mdash; what can I play?</h3>
+    <div class="cc-sig"><span class="fn">legal_points</span>() &rarr; <span class="ty">(B, N2) bool</span></div>
+    <div class="cc-desc">
+      Returns a mask of every legal board placement for the current side to move. Pass is always legal and handled at the action level &mdash; it is not in this mask.<br><br>
+      <strong>Side effect:</strong> the engine analyzes the full position and <em>caches</em> the result. This is the expensive call &mdash; everything downstream rides for free on this analysis.
+    </div>
+  </div>
+  <div class="call-card cc-commit">
+    <h3 class="c-action">2. Commit &mdash; apply my chosen move</h3>
+    <div class="cc-sig"><span class="fn">state_transition</span>(action_ids) &rarr; <span class="ty">GameState</span></div>
+    <div class="cc-desc">
+      Accepts <code>(B,)</code> action IDs (<code>0..N2-1</code> = placement, <code>N2</code> = pass). Mutates the board, pass counter, Zobrist hashes, and side-to-move <em>in-place</em>.<br><br>
+      <strong>Key contract:</strong> the engine does <em>not</em> re-check legality. It reuses the cached analysis from the query call. The caller is responsible for only submitting legal actions.
+    </div>
+  </div>
+</div>
+
+<p>A concrete example &mdash; <code>RandomBot.select_actions()</code>:</p>
+
+<div class="code-block"><span class="cm"># agents/random_bot.py &mdash; the simplest possible caller</span>
+
+legal_points = engine.<span class="fn">legal_points</span>()   <span class="cm"># (B, N2) bool &larr; triggers full analysis + cache</span>
+
+<span class="cm"># build a (B, N2+1) probability mask: board placements + pass</span>
+legal_actions[:, :N2] = legal_points
+legal_actions[:, N2]  = <span class="kw">True</span>          <span class="cm"># pass is always legal</span>
+
+action_ids = <span class="fn">multinomial</span>(legal_actions) <span class="cm"># (B,) &larr; random choice</span>
+
+<span class="cm"># caller loop hands action_ids to the engine:</span>
+engine.<span class="fn">state_transition</span>(action_ids)     <span class="cm"># reuses cached analysis &mdash; no redundant work</span></div>
+
+<p>An MCTS bot follows the same pattern: call <code>legal_points()</code> once at the root, run simulations, then call <code>state_transition()</code> with the chosen action.</p>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<section>
+<h2>2. The State Register File</h2>
+
+<p>All mutable game state lives in four tensor &ldquo;registers&rdquo; inside a <code>GameState</code> dataclass. The <code>GameStateMachine</code> holds direct references to these tensors &mdash; no cloning, no indirection. Every register has a batch dimension for <strong>B parallel games</strong>.</p>
+
+<div class="reg-grid">
+  <div class="reg-card rc-boards">
+    <div class="rc-name c-boards">boards</div>
+    <div class="rc-shape">(B, N2) int8</div>
+    <div class="rc-bits">
+      The stone grid flattened to N2 = board_size&sup2; points.
+      Each cell is 8 bits: <code>EMPTY=0</code> <code>BLACK=1</code> <code>WHITE=2</code>.
+    </div>
+  </div>
+  <div class="reg-card rc-toplay">
+    <div class="rc-name c-toplay">to_play</div>
+    <div class="rc-shape">(B,) int8</div>
+    <div class="rc-bits">
+      1 bit of information in an int8 lane: <code>0</code>=Black, <code>1</code>=White.
+      Flipped via <code>XOR 1</code> after each non-terminal action.
+      Color derivation: <code>to_play + 1</code> maps directly to Stone enum values.
+    </div>
+  </div>
+  <div class="reg-card rc-passcount">
+    <div class="rc-name c-passcount">pass_count</div>
+    <div class="rc-shape">(B,) int8</div>
+    <div class="rc-bits">
+      A 2-bit saturating counter (values 0, 1, 2) stored in int8. Incremented on pass, clamped at 2. Reset to 0 on any placement. <code>&ge; 2</code> = game over.
+    </div>
+  </div>
+  <div class="reg-card rc-zobrist">
+    <div class="rc-name c-zobrist">zobrist_hash</div>
+    <div class="rc-shape">(B, 2) int32</div>
+    <div class="rc-bits">
+      A two-slot shift register: <code>[:,0]</code> = current hash, <code>[:,1]</code> = previous hash. On commit, current shifts into previous; the new hash is written from precomputed candidates.
+    </div>
+  </div>
+</div>
+
+<p>A fresh game starts from <code>create_empty_game_state(B, board_size, device)</code>: all boards <code>EMPTY</code>, <code>to_play</code> = Black, <code>pass_count</code> = 0, both hashes = 0.</p>
+
+<h3>Why these four are sufficient</h3>
+<p>There is no &ldquo;move history&rdquo; tensor, no group table, no liberty count in the state.
+All structural information (connected groups, liberties, CSR topology, capturable neighbors, candidate hashes) is <strong>derived on-the-fly</strong> from <code>boards</code> + <code>to_play</code> during the analysis pass, cached for the duration of the turn, then discarded.
+The only historical information the engine retains is the single previous Zobrist hash &mdash; just enough for simple ko detection.</p>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<section>
+<h2>3. The Analyze-Once Pattern</h2>
+
+<p>Legality checking for Go is expensive because it requires full board analysis: finding every connected group, counting their liberties, identifying which opponent groups can be captured, and building the topological data needed for fast capture execution. This analysis is <strong>position-specific</strong> &mdash; it depends entirely on the current board state and cannot be carried over once a stone is placed.</p>
+
+<p>The core insight: both the query (<code>legal_points</code>) and the commit (<code>state_transition</code>) need the <em>same</em> analysis. So the engine computes it exactly once, caches it, and both calls consume the same cached result.</p>
+
+<div class="mermaid-wrap">
+  <div class="mermaid">
+flowchart LR
+    subgraph analyze ["Analysis Pass (expensive, runs once)"]
+        direction TB
+        UF["Union-Find\n groups + liberties"]
+        CSR["CSR Build\n batch-global topology"]
+        LEG["Legality Check\n A: liberty B: capture C: safe attach"]
+        HASH["Candidate Hashes\n Zobrist per placement"]
+        UF --> CSR --> LEG --> HASH
+    end
+
+    subgraph cache ["Cache Slots"]
+        C1["legal_points_raw\n(B,N2) bool"]
+        C2["LegalInfo\nCSR + capture metadata"]
+        C3["candidate_hashes\n(B,N2) int32"]
+    end
+
+    subgraph consumers ["Consumers"]
+        LP["legal_points()\nko filter + return mask"]
+        ST["state_transition()\ncapture + place + hash update"]
+    end
+
+    analyze -->|populate| cache
+    cache -->|read| LP
+    cache -->|read| ST
+    ST -->|"_invalidate_latest()"| cache
+  </div>
+</div>
+
+<h3>The gatekeeper: <code>_get_or_compute_latest()</code></h3>
+
+<p>Every path that needs the analysis goes through this single function. If the cache is warm (same position), it returns immediately. If any slot is <code>None</code>, it triggers the full analysis pipeline and populates all three cache slots atomically.</p>
+
+<div class="code-block"><span class="cm"># Inside GameStateMachine</span>
+
+<span class="kw">def</span> <span class="fn">_get_or_compute_latest</span>(self):
+    <span class="kw">if</span> self._latest_legal_points_raw <span class="kw">is None</span>   \
+    <span class="kw">or</span> self._latest_legal_info <span class="kw">is None</span>         \
+    <span class="kw">or</span> self._latest_candidate_hashes <span class="kw">is None</span>:
+        <span class="kw">return</span> self.<span class="fn">_compute_legal_and_candidates</span>()  <span class="cm"># full analysis</span>
+
+    <span class="kw">return</span> (                                       <span class="cm"># cache hit</span>
+        self._latest_legal_points_raw,
+        self._latest_legal_info,
+        self._latest_candidate_hashes,
+    )</div>
+
+<h3>Cache lifecycle within one turn</h3>
+
+<table class="mapping-table">
+<thead><tr><th>Cache Slot</th><th>Shape</th><th>Populated by</th><th>Consumed by</th></tr></thead>
+<tbody>
+<tr>
+  <td><code class="c-cache">_latest_legal_points_raw</code></td>
+  <td><code>(B, N2) bool</code></td>
+  <td><code>_compute_legal_and_candidates</code></td>
+  <td><code>legal_points</code> &mdash; feeds into ko filter</td>
+</tr>
+<tr>
+  <td><code class="c-cache">_latest_legal_info</code></td>
+  <td><code>LegalInfo</code></td>
+  <td><code>_compute_legal_and_candidates</code></td>
+  <td><code>state_transition</code> &mdash; CSR metadata drives capture execution</td>
+</tr>
+<tr>
+  <td><code class="c-cache">_latest_candidate_hashes</code></td>
+  <td><code>(B, N2) int32</code></td>
+  <td><code>_build_candidate_hashes</code></td>
+  <td><code>legal_points</code> (ko filter) + <code>state_transition</code> (Zobrist update)</td>
+</tr>
+</tbody>
+</table>
+
+<p>After <code>state_transition()</code> mutates the board, it calls <code>_invalidate_latest()</code> which sets all three cache slots to <code>None</code>. The next <code>legal_points()</code> call will trigger a fresh analysis on the new position.</p>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<section>
+<h2>4. What the Analysis Discovers</h2>
+
+<p>The analysis pass is a pipeline inside <code>BoardRulesChecker</code> + <code>GameStateMachine</code>. Each stage builds on the previous one. Here is what gets computed, why it matters, and how the commit phase reuses it.</p>
+
+<div class="pipeline">
+
+  <div class="pipe-row ph-analyze">
+    <div class="pipe-label">Neighbor Colors<br><span style="font-size:.7rem;font-weight:400">_get_neighbor_colors_batch</span></div>
+    <div class="pipe-content">
+      For every point on every board, gather the colors of its 4 neighbors (N/S/W/E). Off-board edges are marked with a sentinel. This <code>(B, N2, 4) int8</code> tensor is the foundation for everything that follows.
+    </div>
+  </div>
+
+  <div class="pipe-arrow"><span></span></div>
+
+  <div class="pipe-row ph-analyze">
+    <div class="pipe-label">Union-Find<br><span style="font-size:.7rem;font-weight:400">_batch_init_union_find</span></div>
+    <div class="pipe-content">
+      Batched hook-and-compress union-find groups same-colored adjacent stones into connected components. Produces two <code>(B, N2) int32</code> tensors: <strong>roots</strong> (each stone&rsquo;s group representative) and <strong>root_libs</strong> (liberty count per group root). Liberty counting uses sort + unique_consecutive to deduplicate shared liberties.
+    </div>
+  </div>
+
+  <div class="pipe-arrow"><span></span></div>
+
+  <div class="pipe-row ph-analyze">
+    <div class="pipe-label">CSR Topology<br><span style="font-size:.7rem;font-weight:400">_build_group_csr</span></div>
+    <div class="pipe-content">
+      Packs all stone groups across the entire batch into a single <strong>Compressed Sparse Row</strong> structure. This enables O(1) lookup of any group&rsquo;s stones by global group ID &mdash; critical for fast capture execution.
+      <div style="margin-top:.5rem;font-size:.8rem;color:var(--dim)">
+        <code>stone_point_ids (K,)</code> &mdash; all stone positions, group-major<br>
+        <code>stone_pointer_by_group (R+1,)</code> &mdash; CSR row pointers<br>
+        <code>group_offset_by_board (B+1,)</code> &mdash; local &rarr; global group ID offset<br>
+        <code>group_local_id_by_root_point (B, N2)</code> &mdash; root &rarr; local group ID
+      </div>
+    </div>
+  </div>
+
+  <div class="pipe-arrow"><span></span></div>
+
+  <div class="pipe-row ph-analyze">
+    <div class="pipe-label">Legality Check<br><span style="font-size:.7rem;font-weight:400">compute_batch_legal_and_info</span></div>
+    <div class="pipe-content">
+      For every empty point, tests three conditions. A point is legal if <em>any</em> condition holds:
+      <div style="margin:.4rem 0;padding-left:1rem;border-left:2px solid var(--border);font-size:.82rem">
+        <strong>A)</strong> Has an adjacent empty point (immediate liberty after placement)<br>
+        <strong>B)</strong> An adjacent opponent group has exactly 1 liberty (placement captures it)<br>
+        <strong>C)</strong> An adjacent friendly group has &gt;1 liberty (safe attachment, no suicide)
+      </div>
+      Also produces <code>captured_group_local_ids (B, N2, 4)</code> &mdash; for each point, the up-to-4 opponent groups that <em>would</em> be captured if a stone were placed there. This is what makes capture execution instant at commit time.
+    </div>
+  </div>
+
+  <div class="pipe-arrow"><span></span></div>
+
+  <div class="pipe-row ph-analyze">
+    <div class="pipe-label">Candidate Hashes<br><span style="font-size:.7rem;font-weight:400">_build_candidate_hashes</span></div>
+    <div class="pipe-content">
+      For every board point, computes the Zobrist hash that <em>would</em> result from placing a stone there. This is a multi-step XOR pipeline:
+      <div style="margin:.4rem 0;font-size:.82rem">
+        <strong>1.</strong> Placement delta &mdash; <code>Z(empty) &oplus; Z(new_color)</code> per point<br>
+        <strong>2.</strong> Capture delta &mdash; prefix-XOR scan over CSR gives per-group hash contribution; up to 4 neighbor captures XOR&rsquo;d per point<br>
+        <strong>3.</strong> Assemble &mdash; <code>current_hash &oplus; placement_delta &oplus; capture_delta</code>
+      </div>
+      These precomputed hashes serve double duty: ko filtering (compare against previous hash) and Zobrist update at commit time (direct lookup by chosen point).
+    </div>
+  </div>
+
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<section>
+<h2>5. The Commit Pass &mdash; Consuming the Analysis</h2>
+
+<p>When the bot calls <code>state_transition(action_ids)</code>, the engine consumes the cached analysis through a lightweight sequence of in-place mutations. No union-find, no CSR build, no Zobrist recomputation &mdash; all of that was done during the query.</p>
+
+<div class="pipeline">
+
+  <div class="pipe-row ph-commit">
+    <div class="pipe-label">Normalize Actions</div>
+    <div class="pipe-content">
+      Classify each action: placement vs. pass vs. terminal no-op. Finished games (<code>pass_count &ge; 2</code>) are force-routed to the pass path regardless of the action submitted.
+      <div style="margin-top:.3rem;font-size:.8rem;color:var(--dim)">
+        Reads: <code class="c-action">action_ids</code> <code class="c-passcount">pass_count</code><br>
+        Produces: <code>point_ids</code> <code>is_pass</code> <code>play_mask</code> <code>finished</code>
+      </div>
+    </div>
+  </div>
+
+  <div class="pipe-arrow"><span></span></div>
+
+  <div class="pipe-row ph-commit">
+    <div class="pipe-label">Update pass_count</div>
+    <div class="pipe-content">
+      The 2-bit counter shifts: placement &rarr; reset to 0, pass &rarr; increment (clamped at 2).
+      <div style="margin-top:.3rem;font-size:.8rem;color:var(--dim)">
+        Mutates: <code class="c-passcount">pass_count</code>
+      </div>
+    </div>
+  </div>
+
+  <div class="pipe-arrow"><span></span></div>
+
+  <div class="pipe-row ph-commit">
+    <div class="pipe-label">Capture + Place</div>
+    <div class="pipe-content">
+      For each active game with a placement, uses the <strong>cached <code>LegalInfo</code></strong> to resolve captures:
+      <div style="margin:.3rem 0;font-size:.82rem">
+        <strong>1.</strong> Look up <code>captured_group_local_ids[b, point]</code> &rarr; up to 4 group IDs<br>
+        <strong>2.</strong> Convert local &rarr; global group ID via <code>group_offset_by_board</code><br>
+        <strong>3.</strong> Dereference CSR: <code>stone_pointer_by_group[g]..stone_pointer_by_group[g+1]</code> gives the captured stones<br>
+        <strong>4.</strong> Set captured stones to <code>EMPTY</code>, then write new stone
+      </div>
+      <div style="font-size:.8rem;color:var(--dim)">
+        Mutates: <code class="c-boards">boards</code> &mdash; Reads from cache: <code class="c-cache">LegalInfo.csr</code> + <code class="c-cache">captured_group_local_ids</code>
+      </div>
+    </div>
+  </div>
+
+  <div class="pipe-arrow"><span></span></div>
+
+  <div class="pipe-row ph-commit">
+    <div class="pipe-label">Zobrist Shift</div>
+    <div class="pipe-content">
+      The hash shift register advances: <code>prev &larr; cur</code>, then for placement games: <code>cur &larr; candidate_hashes[b, point]</code>. The candidate hash was precomputed during analysis &mdash; no XOR pipeline runs here.
+      <div style="margin-top:.3rem;font-size:.8rem;color:var(--dim)">
+        Mutates: <code class="c-zobrist">zobrist_hash</code> &mdash; Reads from cache: <code class="c-cache">candidate_hashes</code>
+      </div>
+    </div>
+  </div>
+
+  <div class="pipe-arrow"><span></span></div>
+
+  <div class="pipe-row ph-flush">
+    <div class="pipe-label">Side Flip +<br>Cache Flush</div>
+    <div class="pipe-content">
+      <code>to_play ^= 1</code> for non-finished games (a single XOR flips Black&harr;White). Then <code>_invalidate_latest()</code> sets all cache slots to <code>None</code>, ensuring the next <code>legal_points()</code> triggers a fresh analysis on the new position.
+      <div style="margin-top:.3rem;font-size:.8rem;color:var(--dim)">
+        Mutates: <code class="c-toplay">to_play</code> &mdash; Clears: all cache slots
+      </div>
+    </div>
+  </div>
+
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<section>
+<h2>6. Workspace Reuse &mdash; Persistent Buffers</h2>
+
+<p>Tensor allocation on GPU is not free. The engine uses a <strong>capacity-based lazy-alloc</strong> pattern: scratch buffers are allocated once on first use, then reused across every subsequent call without reallocation. This mirrors how a CPU reuses register files and scratchpad memory across instructions.</p>
+
+<div class="detail-box">
+  <div class="db-title">BoardRulesChecker workspaces</div>
+  <div style="font-size:.82rem;color:var(--dim)">
+    <code>_uf_neighbor_parent</code> &mdash; <code>(B, N2, 4) int32</code> &mdash; union-find scratch for pointer jumping<br>
+    <code>_stone_point_ids_buf</code>, <code>_stone_pointer_buf</code>, <code>_group_offset_buf</code>, <code>_group_local_id_buf</code> &mdash; CSR output buffers, capacity-tracked<br>
+    <code>point_ids_i32</code> &mdash; precomputed <code>arange(N2)</code> reused as initial UF parent array
+  </div>
+</div>
+
+<div class="detail-box">
+  <div class="db-title">GameStateMachine workspaces</div>
+  <div style="font-size:.82rem;color:var(--dim)">
+    <code>_placement_delta_buf</code> &mdash; <code>(B, N2) int32</code><br>
+    <code>_capture_delta_buf</code> &mdash; <code>(B, N2) int32</code><br>
+    <code>_candidate_hashes_buf</code> &mdash; <code>(B, N2) int32</code><br>
+    <code>_cap_vals_buf</code> &mdash; <code>(B, N2, 4) int32</code><br>
+    <code>_group_xor_buf</code> &mdash; <code>(B*N2,) int32</code><br>
+    <code>_prefix_scratch_buf</code> &mdash; <code>(B*N2,) int32</code> &mdash; eliminates per-iteration clones in prefix-XOR scan
+  </div>
+</div>
+
+<p>All workspace buffers are allocated with <code>torch.empty</code> (no zeroing cost) and only grow if the batch &times; board size increases. Between calls, the tensors stay resident on the GPU &mdash; only the data inside them changes.</p>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<section>
+<h2>7. The Full Turn &mdash; Instruction-Level View</h2>
+
+<p>Here is the complete sequence of operations for one turn, annotated with what each step reads from and writes to. The key observation: the expensive analysis (left column) runs once, and both the query return and the commit consume the same cached result.</p>
+
+<div class="mermaid-wrap">
+  <div class="mermaid">
+sequenceDiagram
+    participant Bot
+    participant Engine as GameStateMachine
+    participant Cache as Cache Slots
+    participant Checker as BoardRulesChecker
+    participant State as GameState Registers
+
+    Bot->>Engine: legal_points()
+    activate Engine
+
+    Engine->>Engine: _get_or_compute_latest()
+    Note over Engine: cache is None → trigger analysis
+
+    Engine->>Checker: compute_batch_legal_and_info(boards, to_play+1)
+    activate Checker
+    Checker->>Checker: neighbor colors → union-find → CSR → legality
+    Checker-->>Engine: raw_legal_mask + LegalInfo
+    deactivate Checker
+
+    Engine->>Engine: _build_candidate_hashes(LegalInfo)
+    Note over Engine: Zobrist XOR pipeline using CSR
+
+    Engine->>Cache: store raw_legal, LegalInfo, candidate_hashes
+    Engine->>Engine: ko filter: raw_legal & ~(candidate == prev_hash)
+    Engine-->>Bot: legal_points (B,N2) bool
+    deactivate Engine
+
+    Note over Bot: Bot selects action from legal mask
+
+    Bot->>Engine: state_transition(action_ids)
+    activate Engine
+
+    Engine->>Cache: _get_or_compute_latest() → cache hit
+    Note over Engine: No recomputation — same position
+
+    Engine->>Engine: normalize actions → play_mask, is_pass
+    Engine->>State: pass_count update
+    Engine->>State: capture + place (via cached LegalInfo.csr)
+    Engine->>State: zobrist shift (via cached candidate_hashes)
+    Engine->>State: to_play ^= 1
+
+    Engine->>Cache: _invalidate_latest() → all slots = None
+    Engine-->>Bot: mutated GameState
+    deactivate Engine
+  </div>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<section>
+<h2>8. Register Mutation Summary</h2>
+
+<p>Each register is touched at a specific point in the commit pass. The table shows the exact mutation and the source of the new value.</p>
+
+<table class="mapping-table">
+<thead><tr><th>Register</th><th>Mutation</th><th>Value source</th><th>Condition</th></tr></thead>
+<tbody>
+<tr>
+  <td><code class="c-passcount">pass_count</code></td>
+  <td>reset to 0 <em>or</em> increment (clamp 2)</td>
+  <td>Computed from <code>is_pass</code> flag</td>
+  <td>All games</td>
+</tr>
+<tr>
+  <td><code class="c-boards">boards</code></td>
+  <td>Captured stones &rarr; <code>EMPTY</code>; new stone written</td>
+  <td>Cached <code>LegalInfo.csr</code> + <code>captured_group_local_ids</code></td>
+  <td>Only <code>play_mask</code> games</td>
+</tr>
+<tr>
+  <td><code class="c-zobrist">zobrist_hash[:,1]</code></td>
+  <td><code>prev &larr; cur</code> (shift)</td>
+  <td>Copy of column 0</td>
+  <td>All games</td>
+</tr>
+<tr>
+  <td><code class="c-zobrist">zobrist_hash[:,0]</code></td>
+  <td><code>cur &larr; candidate_hashes[b, point]</code></td>
+  <td>Cached <code>candidate_hashes</code></td>
+  <td>Only <code>play_mask</code> games</td>
+</tr>
+<tr>
+  <td><code class="c-toplay">to_play</code></td>
+  <td><code>XOR 1</code></td>
+  <td>Self (bit flip)</td>
+  <td>Non-finished games</td>
+</tr>
+</tbody>
+</table>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<section>
+<h2>9. Scoring Path (Terminal)</h2>
+
+<p>After two consecutive passes (<code>pass_count &ge; 2</code>), the game enters the <strong>Finished</strong> state. Scoring uses Chinese-style area counting and runs a separate union-find over empty regions &mdash; this is independent of the legality analysis cache.</p>
+
+<div class="scoring-flow">
+  <div class="sf-box sf-boards">boards (B,N2)</div>
+  <div class="sf-arrow">&rarr;</div>
+  <div class="sf-box sf-territory">compute_territory</div>
+  <div class="sf-arrow">&rarr;</div>
+  <div class="sf-box sf-scores">compute_scores</div>
+  <div class="sf-arrow">&rarr;</div>
+  <div class="sf-box sf-outcome">game_outcomes</div>
+</div>
+
+<div class="code-block"><span class="cm"># Scoring API</span>
+scores   = engine.<span class="fn">compute_scores</span>(komi=6.5)   <span class="cm"># (B, 2): [black_area, white_area+komi]</span>
+outcomes = engine.<span class="fn">game_outcomes</span>(komi=6.5)   <span class="cm"># (B,) int8: +1 Black, -1 White, 0 Draw</span>
+ratios   = engine.<span class="fn">outcome_ratios</span>(komi=6.5)  <span class="cm"># {"black": float, "white": float, ...}</span></div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<section>
+<h2>Appendix: Why Analyze-Once Matters for Go</h2>
+
+<div class="appendix">
+  <div class="ap-title">The position-specific structure problem</div>
+  <p>Legality checking in Go is not a simple rule lookup. It requires discovering the full topological structure of the board &mdash; which stones are connected, how many liberties each group has, which groups are capturable, and what the board hash would look like after each possible move. This structural analysis is:</p>
+
+  <ul style="margin:.5rem 0 .5rem 1.5rem;font-size:.85rem;line-height:1.8">
+    <li><strong>Expensive</strong> &mdash; union-find, sorting, CSR construction, prefix-XOR scans</li>
+    <li><strong>Position-specific</strong> &mdash; every placement changes the group structure, invalidating everything</li>
+    <li><strong>Shared</strong> &mdash; the legality query and the move commit need the exact same structural data</li>
+  </ul>
+
+  <p>The analyze-once pattern exploits this: compute the full structural analysis when the bot asks &ldquo;what can I play?&rdquo;, cache it, and when the bot says &ldquo;play here&rdquo;, consume the cached result to apply captures and update hashes in a single pass. The commit is essentially a table lookup into the analysis &mdash; index the CSR by the chosen point&rsquo;s capture IDs, index the candidate hashes by the chosen point, done.</p>
+</div>
+
+<div class="appendix">
+  <div class="ap-title">The five products of analysis and who consumes them</div>
+  <table class="mapping-table" style="margin:.6rem 0 0">
+  <thead><tr><th>Product</th><th>Query consumer</th><th>Commit consumer</th></tr></thead>
+  <tbody>
+  <tr>
+    <td>Connected groups (roots)</td>
+    <td>Legality conditions B and C (neighbor lib counts)</td>
+    <td>&mdash; (folded into CSR)</td>
+  </tr>
+  <tr>
+    <td>Liberty counts per group</td>
+    <td>Legality condition B (capture: libs==1) and C (safe: libs&gt;1)</td>
+    <td>&mdash;</td>
+  </tr>
+  <tr>
+    <td>CSR group topology</td>
+    <td>Capture metadata construction</td>
+    <td>Capture execution (enumerate stones in captured groups)</td>
+  </tr>
+  <tr>
+    <td>Captured group IDs per point</td>
+    <td>&mdash; (passed through in LegalInfo)</td>
+    <td>Capture execution (which groups to clear)</td>
+  </tr>
+  <tr>
+    <td>Candidate Zobrist hashes</td>
+    <td>Ko filter (compare against previous hash)</td>
+    <td>Zobrist shift register update</td>
+  </tr>
+  </tbody>
+  </table>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<section>
+<h2>Source Reference</h2>
+
+<table class="mapping-table">
+<thead><tr><th>File</th><th>Key contents</th></tr></thead>
+<tbody>
+<tr>
+  <td><code>engine/stones.py</code></td>
+  <td><code>Stone(IntEnum)</code> &mdash; <code>EMPTY=0</code>, <code>BLACK=1</code>, <code>WHITE=2</code></td>
+</tr>
+<tr>
+  <td><code>engine/game_state.py</code></td>
+  <td><code>GameState</code> dataclass + <code>create_empty_game_state()</code> factory</td>
+</tr>
+<tr>
+  <td><code>engine/game_state_machine.py</code></td>
+  <td><code>GameStateMachine</code>: analysis, caching, commit, Zobrist, ko, scoring</td>
+</tr>
+<tr>
+  <td><code>engine/board_rules_checker.py</code></td>
+  <td><code>BoardRulesChecker</code>: union-find, CSR, legality, territory</td>
+</tr>
+<tr>
+  <td><code>agents/random_bot.py</code></td>
+  <td><code>RandomBot</code>: minimal caller example &mdash; query &rarr; sample &rarr; commit</td>
+</tr>
+</tbody>
+</table>
+</section>
+
+<div class="footer">state_transition_pipeline.html &mdash; analyze once, commit once &mdash; visual companion to engine/game_state_machine.py</div>
+
+<script type="module">
+import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'dark',
+  themeVariables: {
+    primaryColor: '#111820',
+    primaryTextColor: '#c8d4e0',
+    primaryBorderColor: '#2a3a50',
+    lineColor: '#5eaaf5',
+    secondaryColor: '#171e28',
+    tertiaryColor: '#0a0e14',
+    fontFamily: "'Source Code Pro', monospace",
+    fontSize: '13px',
+  },
+  flowchart: {
+    curve: 'basis',
+    padding: 16,
+    htmlLabels: true,
+  },
+  sequence: {
+    mirrorActors: false,
+    actorMargin: 50,
+    messageMargin: 30,
+  },
+});
+</script>
+
+</body>
+</html>

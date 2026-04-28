@@ -1,7 +1,6 @@
 # engine/game_state_machine.py
 from __future__ import annotations
 
-import os
 from typing import Tuple
 
 import torch
@@ -12,14 +11,6 @@ from .stones import Stone
 from .game_state import GameState
 from .board_rules_checker import BoardRulesChecker, LegalInfo
 from utils.shared import timed_method
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    """Parse a boolean environment flag."""
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 class GameStateMachine:
@@ -55,22 +46,9 @@ class GameStateMachine:
     def __init__(
         self,
         game_state: GameState,
-        alloc_per_call_checker: bool | None = None,
-        no_cache_latest: bool | None = None,
     ) -> None:
         # keep a reference to the workspace object
         self.state = game_state
-
-        self.alloc_per_call_checker = (
-            _env_flag("GO_ENGINE_ALLOC_PER_CALL_CHECKER", False)
-            if alloc_per_call_checker is None
-            else bool(alloc_per_call_checker)
-        )
-        self.no_cache_latest = (
-            _env_flag("GO_ENGINE_NO_CACHE_LATEST", False)
-            if no_cache_latest is None
-            else bool(no_cache_latest)
-        )
 
         # unwrap tensors as direct references (no clone)
         self.boards = game_state.boards          # (B, N2)
@@ -89,7 +67,6 @@ class GameStateMachine:
         self.legal_checker = BoardRulesChecker(
             board_size=self.board_size,
             device=self.device,
-            alloc_per_call_checker=self.alloc_per_call_checker,
         )
 
         # Zobrist tables for candidate-hash building
@@ -100,6 +77,9 @@ class GameStateMachine:
         self._latest_legal_points: Tensor | None = None       # (B, N2) after ko filter
         self._latest_legal_info: LegalInfo | None = None
         self._latest_candidate_hashes: Tensor | None = None
+
+        # Candidate-hash workspace (lazy, capacity-based like CSR buffers)
+        self._hash_workspace_capacity = 0
 
     # ------------------------------------------------------------------ #
     # Zobrist init                                                       #
@@ -193,8 +173,9 @@ class GameStateMachine:
             torch.zeros_like(pass_count),
         )
 
-        self._apply_placement_and_capture(point_ids, play_mask, legal_info)
-        self._apply_zobrist_update(point_ids, is_pass, candidate_hashes)
+        if play_mask.any():
+            self._apply_placement_and_capture(point_ids, play_mask, legal_info)
+        self._apply_zobrist_update(point_ids, play_mask, candidate_hashes)
 
         flipped = to_play ^ 1
         to_play[:] = torch.where(finished, to_play, flipped)
@@ -292,9 +273,6 @@ class GameStateMachine:
         legal_info         : LegalInfo
         candidate_hashes   : (B, N2) int32
         """
-        if self.no_cache_latest:
-            return self._compute_legal_and_candidates(cache_results=False)
-
         if (
             self._latest_legal_points_raw is None
             or self._latest_legal_info is None
@@ -313,7 +291,6 @@ class GameStateMachine:
     @torch.no_grad()
     def _compute_legal_and_candidates(
         self,
-        cache_results: bool = True,
     ) -> Tuple[Tensor, LegalInfo, Tensor]:
         """
         Compute board-point legality, capture metadata, and candidate hashes
@@ -328,21 +305,16 @@ class GameStateMachine:
         boards = self.boards
         to_play = self.to_play
 
-        to_play_color = torch.where(
-            to_play == 0,
-            torch.full_like(to_play, Stone.BLACK, dtype=torch.int8),
-            torch.full_like(to_play, Stone.WHITE, dtype=torch.int8),
-        )
+        to_play_color = (to_play + 1).to(torch.int8)  # 0→BLACK(1), 1→WHITE(2)
         legal_points_raw, legal_info = self.legal_checker.compute_batch_legal_and_info(
             board=boards,
             to_play_color=to_play_color,
         )
         candidate_hashes = self._build_candidate_hashes(legal_info)
 
-        if cache_results:
-            self._latest_legal_points_raw = legal_points_raw
-            self._latest_legal_info = legal_info
-            self._latest_candidate_hashes = candidate_hashes
+        self._latest_legal_points_raw = legal_points_raw
+        self._latest_legal_info = legal_info
+        self._latest_candidate_hashes = candidate_hashes
 
         return legal_points_raw, legal_info, candidate_hashes
 
@@ -373,13 +345,23 @@ class GameStateMachine:
         device = self.device
         B = self.batch_size
         N2 = self.N2
+        BN2 = B * N2
 
-        # Per-call scratch buffers keep this path simple and stateless.
-        placement_delta = torch.zeros((B, N2), dtype=torch.int32, device=device)
-        capture_delta = torch.zeros((B, N2), dtype=torch.int32, device=device)
-        candidate_hashes = torch.zeros((B, N2), dtype=torch.int32, device=device)
-        cap_vals = torch.zeros((B, N2, 4), dtype=torch.int32, device=device)
-        group_xor_workspace = torch.zeros(B * N2, dtype=torch.int32, device=device)
+        # Reusable scratch buffers (lazy-alloc, capacity-based)
+        if self._hash_workspace_capacity < BN2:
+            self._placement_delta_buf = torch.empty((B, N2), dtype=torch.int32, device=device)
+            self._capture_delta_buf = torch.empty((B, N2), dtype=torch.int32, device=device)
+            self._candidate_hashes_buf = torch.empty((B, N2), dtype=torch.int32, device=device)
+            self._cap_vals_buf = torch.empty((B, N2, 4), dtype=torch.int32, device=device)
+            self._group_xor_buf = torch.empty(BN2, dtype=torch.int32, device=device)
+            self._prefix_scratch_buf = torch.empty(BN2, dtype=torch.int32, device=device)
+            self._hash_workspace_capacity = BN2
+
+        placement_delta = self._placement_delta_buf
+        capture_delta = self._capture_delta_buf
+        candidate_hashes = self._candidate_hashes_buf
+        cap_vals = self._cap_vals_buf
+        group_xor_workspace = self._group_xor_buf
 
         # ---------- Phase 1: placement delta (Zobrist) ----------
         # XOR of Z(empty) with Z(new color) for every point.
@@ -449,11 +431,13 @@ class GameStateMachine:
 
         # ---------- Phase 4: prefix XOR → per-group capture XOR ----------
         # Parallel prefix scan turns per-stone deltas into per-group XOR sums.
+        # Uses a pre-allocated scratch buffer to avoid log2(K) clone allocations.
         prefix = per_stone_delta.clone()  # (K,)
+        scratch = self._prefix_scratch_buf[:K]
         offset = 1
         while offset < K:
-            prev = prefix.clone()
-            prefix[offset:] ^= prev[:-offset]
+            scratch.copy_(prefix)
+            prefix[offset:] ^= scratch[:-offset]
             offset <<= 1
 
         start_idx = stone_pointer_by_group[:-1].to(torch.int64)  # (R,)
@@ -485,14 +469,10 @@ class GameStateMachine:
         cap_vals.copy_(safe_local_ids)
         cap_vals.add_(group_offset_per_board)                  # now batch-global group ids
 
-        if group_xor_buf.numel() and has_capture.any():
-            global_group_gather_idx = cap_vals[has_capture].to(torch.int64)
-            cap_vals.zero_()
-            cap_vals[has_capture] = group_xor_buf[global_group_gather_idx].to(torch.int32)
-        else:
-            cap_vals.zero_()
+        global_group_gather_idx = cap_vals[has_capture].to(torch.int64)
+        cap_vals.zero_()
+        cap_vals[has_capture] = group_xor_buf[global_group_gather_idx].to(torch.int32)
 
-        capture_delta.zero_()
         capture_delta.copy_(cap_vals[..., 0])
         capture_delta ^= cap_vals[..., 1]
         capture_delta ^= cap_vals[..., 2]
@@ -571,25 +551,19 @@ class GameStateMachine:
     ) -> None:
         """
         Apply captures (if any) then place stones for games where
-        ``play_mask`` is True.
+        ``play_mask`` is True.  Caller guarantees at least one True in play_mask.
         """
-        if not play_mask.any():
-            return
-
         dev = self.device
         B = self.batch_size
         N2 = self.N2
         boards = self.boards
+        boards_linear = boards.view(-1)
 
         active_idx = play_mask.nonzero(as_tuple=True)[0]           # (M,)
         active_point_ids = point_ids[active_idx].to(torch.int64)   # (M,)
 
         player_idx = self.to_play[active_idx]                      # (M,) int8
-        current_color = torch.where(
-            player_idx == 0,
-            torch.full_like(player_idx, Stone.BLACK, dtype=torch.int8),
-            torch.full_like(player_idx, Stone.WHITE, dtype=torch.int8),
-        )                                                          # (M,) int8
+        current_color = (player_idx + 1).to(torch.int8)              # (M,) int8
 
         # CSR / capture metadata
         csr = legal_info.csr
@@ -644,12 +618,10 @@ class GameStateMachine:
                     board_for_group, stones_per_group
                 )
 
-                boards_linear = boards.view(-1)
                 captured_linear_idx = board_for_stone * N2 + captured_point_ids
                 boards_linear[captured_linear_idx] = Stone.EMPTY
 
         # ---- Place new stones ----
-        boards_linear = boards.view(-1)
         placement_linear_idx = active_idx.to(torch.int64) * N2 + active_point_ids
         boards_linear[placement_linear_idx] = current_color
 
@@ -660,7 +632,7 @@ class GameStateMachine:
     def _apply_zobrist_update(
         self,
         point_ids: Tensor,         # (B,) long -- point index
-        is_pass: Tensor,           # (B,) bool
+        play_mask: Tensor,         # (B,) bool
         candidate_hashes: Tensor,  # (B, N2) int32
     ) -> None:
         zob = self.zobrist_hash          # (B, 2) int32
@@ -669,7 +641,5 @@ class GameStateMachine:
 
         prev[:] = cur
 
-        play_mask = ~is_pass
-        if play_mask.any():
-            idx = play_mask.nonzero(as_tuple=True)[0]
-            cur[idx] = candidate_hashes[idx, point_ids[idx]]
+        idx = play_mask.nonzero(as_tuple=True)[0]
+        cur[idx] = candidate_hashes[idx, point_ids[idx]]
